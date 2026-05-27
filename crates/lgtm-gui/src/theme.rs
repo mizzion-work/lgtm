@@ -13,6 +13,10 @@ pub const INSERT_BG: Color32 = Color32::from_rgb(0x18, 0x3f, 0x1d);
 pub const REPLACE_BG: Color32 = Color32::from_rgb(0x4a, 0x40, 0x12);
 /// Background tint for the inline-highlighted span inside a `Replace`.
 pub const INLINE_BG: Color32 = Color32::from_rgb(0x88, 0x68, 0x0a);
+/// Background tint for find-matches in the diff view.
+pub const FIND_BG: Color32 = Color32::from_rgb(0x33, 0x55, 0x88);
+/// Background tint for the currently-focused find match (Enter navigates here).
+pub const FIND_CURRENT_BG: Color32 = Color32::from_rgb(0x55, 0xaa, 0xff);
 /// Foreground color for the gutter line numbers.
 pub const GUTTER_FG: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
 

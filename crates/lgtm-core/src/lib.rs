@@ -27,6 +27,7 @@ pub mod diff;
 pub mod document;
 pub mod editor;
 pub mod error;
+pub mod find;
 pub mod folder;
 pub mod highlight;
 pub mod merge;
@@ -41,6 +42,7 @@ pub use diff::{
 pub use document::{DiffDocument, HARD_SIZE_LIMIT, LineEnding, SOFT_SIZE_LIMIT};
 pub use editor::{EditorLauncher, LineArgStyle, resolve_real_path};
 pub use error::{Error, Result};
+pub use find::{FindMatch, FindState, find_matches};
 pub use folder::{FolderDiff, FolderDiffOptions, FolderEntry, FolderEntryStatus};
 pub use highlight::{
     Highlighter, NoopHighlighter, STYLE_BOLD, STYLE_ITALIC, STYLE_UNDERLINE, StyledSpan,

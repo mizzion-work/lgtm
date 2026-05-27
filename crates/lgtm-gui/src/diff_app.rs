@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense};
 use lgtm_core::{
-    AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, Highlighter,
-    HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Settings, Side, StyledSpan,
-    SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
+    AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, FindState,
+    Highlighter, HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Settings, Side,
+    StyledSpan, SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
 };
 
 use crate::menubar::{self, MenuAction, MenuContext};
@@ -113,6 +113,11 @@ pub struct DiffApp {
     /// the doc is dirty) and the rfd picker runs. `Some((Files,))` or
     /// `Some((Folders,))` is set by the menu action handler.
     pending_open: Option<OpenRequest>,
+    /// Find-bar state (query, matches, current index, visibility).
+    pub find: FindState,
+    /// Whenever the find bar opens we want the input box focused — set
+    /// here and consumed by the next render frame.
+    find_focus_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +184,8 @@ impl DiffApp {
             show_about: false,
             show_shortcuts: false,
             pending_open: None,
+            find: FindState::default(),
+            find_focus_pending: false,
         }
     }
 
@@ -220,6 +227,7 @@ impl DiffApp {
         self.blame_cache = BlameCache::new();
         self.diff = AlignedDiff::compute(&self.left, &self.right).with_inline();
         self.refresh_highlights();
+        self.find.recompute(&self.diff.rows);
         // Record into the recent list and persist.
         let entry = RecentEntry::new(
             RecentMode::File,
@@ -459,6 +467,8 @@ impl DiffApp {
             self.current_hunk = self.diff.hunks.len().saturating_sub(1);
         }
         self.refresh_highlights();
+        // The diff changed → find matches must be reindexed.
+        self.find.recompute(&self.diff.rows);
     }
 
     fn mark_edited(&mut self, side: Side) {
@@ -579,6 +589,66 @@ impl DiffApp {
                     ui.label(RichText::new("no blame").color(theme::GUTTER_FG));
                 }
             });
+        }
+    }
+
+    fn render_find_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Find:").color(theme::GUTTER_FG));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.find.query)
+                    .desired_width(280.0)
+                    .hint_text("type to search both panes"),
+            );
+            if std::mem::take(&mut self.find_focus_pending) {
+                resp.request_focus();
+            }
+            if resp.changed() {
+                self.find.recompute(&self.diff.rows);
+            }
+            // Enter / Shift+Enter step through matches even when the
+            // input has focus.
+            if resp.has_focus() {
+                ui.ctx().input(|i| {
+                    if i.key_pressed(Key::Enter) {
+                        let delta = if i.modifiers.shift { -1 } else { 1 };
+                        self.find.step(delta);
+                    }
+                });
+            }
+            if ui
+                .small_button("◀")
+                .on_hover_text("Previous match (Shift+Enter)")
+                .clicked()
+            {
+                self.find.step(-1);
+            }
+            if ui
+                .small_button("▶")
+                .on_hover_text("Next match (Enter)")
+                .clicked()
+            {
+                self.find.step(1);
+            }
+            let count_text = if self.find.query.is_empty() {
+                String::from("—")
+            } else if self.find.is_empty() {
+                String::from("no matches")
+            } else {
+                format!("{} of {}", self.find.current + 1, self.find.len())
+            };
+            ui.label(RichText::new(count_text).color(theme::GUTTER_FG));
+            if ui
+                .small_button("✕")
+                .on_hover_text("Close find bar (Esc)")
+                .clicked()
+            {
+                self.find.visible = false;
+            }
+        });
+        // Scroll the diff to the current match's row.
+        if let Some(m) = self.find.current_match() {
+            self.pending_scroll = Some(m.row);
         }
     }
 
@@ -735,6 +805,8 @@ impl DiffApp {
         let right_path = self.right.path.clone();
         let repo_root = self.repo_root.clone();
         let read_only = self.read_only;
+        let find_matches = &self.find.matches;
+        let find_current = self.find.current;
         let mut hover_focus: Option<HoverFocus> = None;
         let mut pending_copy: Option<(usize, CopyDirection)> = None;
 
@@ -758,6 +830,9 @@ impl DiffApp {
                     read_only,
                     &mut pending_copy,
                     font_size,
+                    idx,
+                    find_matches,
+                    find_current,
                 );
             }
         });
@@ -850,8 +925,18 @@ impl eframe::App for DiffApp {
                 self.settings.reset_font();
                 let _ = self.settings.save();
             }
+            if i.modifiers.command_only() && i.key_pressed(Key::F) {
+                self.find.visible = true;
+                self.find_focus_pending = true;
+            }
             if i.key_pressed(Key::Escape) {
-                self.close_requested = true;
+                // Esc dismisses the find bar first, falling through to
+                // window close only when find isn't active.
+                if self.find.visible {
+                    self.find.visible = false;
+                } else {
+                    self.close_requested = true;
+                }
             }
             if !self.edit_mode {
                 if i.key_pressed(Key::Q) && !i.modifiers.command {
@@ -941,6 +1026,12 @@ impl eframe::App for DiffApp {
         // wait is acceptable for a click-driven flow.
         if let Some(req) = self.pending_open.take() {
             self.run_open_dialog(req);
+        }
+
+        if self.find.visible {
+            egui::TopBottomPanel::top("lgtm-find").show(ctx, |ui| {
+                self.render_find_bar(ui);
+            });
         }
 
         egui::TopBottomPanel::top("lgtm-title").show(ctx, |ui| {
@@ -1138,6 +1229,9 @@ fn render_row_with_blame(
     read_only: bool,
     pending_copy: &mut Option<(usize, CopyDirection)>,
     font_size: f32,
+    row_idx: usize,
+    find_matches: &[lgtm_core::FindMatch],
+    find_current: usize,
 ) {
     let bg = row_background(row);
     let avail = ui.available_width();
@@ -1164,6 +1258,20 @@ fn render_row_with_blame(
         .and_then(|n| right_syntax.get(n.saturating_sub(1)).map(|v| v.as_slice()))
         .unwrap_or(&[]);
 
+    // Collect find-match ranges scoped to this (row, side). The current
+    // match is flagged so build_layout can render it in a brighter color.
+    let mut left_finds: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    let mut right_finds: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    for (i, m) in find_matches.iter().enumerate() {
+        if m.row != row_idx {
+            continue;
+        }
+        let is_current = i == find_current;
+        match m.side {
+            Side::Left => left_finds.push((m.range.clone(), is_current)),
+            Side::Right => right_finds.push((m.range.clone(), is_current)),
+        }
+    }
     let left_resp = render_pane(
         &mut child,
         half,
@@ -1172,6 +1280,7 @@ fn render_row_with_blame(
         Side::Left,
         &parts.inline_left,
         left_spans,
+        &left_finds,
         font_size,
     );
     render_center_column(&mut child, row_height, hunk_idx, read_only, pending_copy);
@@ -1183,6 +1292,7 @@ fn render_row_with_blame(
         Side::Right,
         &parts.inline_right,
         right_spans,
+        &right_finds,
         font_size,
     );
 
@@ -1254,6 +1364,7 @@ fn render_pane(
     side: Side,
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
     syntax: &[StyledSpan],
+    find_ranges: &[(std::ops::Range<usize>, bool)],
     font_size: f32,
 ) -> egui::Response {
     let resp = ui.scope(|ui| {
@@ -1268,7 +1379,7 @@ fn render_pane(
                     .color(theme::GUTTER_FG)
                     .font(FontId::monospace(font_size)),
             );
-            let layout = build_layout(strip_nl(text), syntax, inline, side, font_size);
+            let layout = build_layout(strip_nl(text), syntax, inline, find_ranges, side, font_size);
             ui.label(layout);
         });
     });
@@ -1418,6 +1529,7 @@ fn build_layout(
     display: &str,
     syntax: &[StyledSpan],
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
+    find_ranges: &[(std::ops::Range<usize>, bool)],
     side: Side,
     font_size: f32,
 ) -> egui::text::LayoutJob {
@@ -1437,6 +1549,10 @@ fn build_layout(
         boundaries.push(r.start.min(display_len));
         boundaries.push(r.end.min(display_len));
     }
+    for (r, _) in find_ranges {
+        boundaries.push(r.start.min(display_len));
+        boundaries.push(r.end.min(display_len));
+    }
     boundaries.sort_unstable();
     boundaries.dedup();
 
@@ -1451,7 +1567,12 @@ fn build_layout(
             continue;
         }
         let fg = syntax_fg_at(syntax, start);
-        let bg = inline_bg_at(inline, side, start);
+        // Find matches take priority over inline highlights so the user
+        // can see the search hit clearly inside a Replace row's tinting.
+        let bg = match find_bg_at(find_ranges, start) {
+            Some(c) => c,
+            None => inline_bg_at(inline, side, start),
+        };
         let fmt = egui::TextFormat {
             font_id: font.clone(),
             color: fg,
@@ -1461,6 +1582,22 @@ fn build_layout(
         job.append(&display[start..end], 0.0, fmt);
     }
     job
+}
+
+fn find_bg_at(ranges: &[(std::ops::Range<usize>, bool)], pos: usize) -> Option<Color32> {
+    let mut best: Option<bool> = None;
+    for (r, current) in ranges {
+        if r.contains(&pos) {
+            best = Some(best.unwrap_or(false) || *current);
+        }
+    }
+    best.map(|is_current| {
+        if is_current {
+            theme::FIND_CURRENT_BG
+        } else {
+            theme::FIND_BG
+        }
+    })
 }
 
 fn syntax_fg_at(spans: &[StyledSpan], pos: usize) -> Color32 {
@@ -1733,7 +1870,7 @@ mod tests {
 
     #[test]
     fn build_layout_handles_empty_text() {
-        let job = build_layout("", &[], &[], Side::Left, 13.0);
+        let job = build_layout("", &[], &[], &[], Side::Left, 13.0);
         assert!(job.sections.is_empty());
     }
 
@@ -1751,7 +1888,7 @@ mod tests {
                 style_bits: 0,
             },
         ];
-        let job = build_layout("abcde", &spans, &[], Side::Left, 13.0);
+        let job = build_layout("abcde", &spans, &[], &[], Side::Left, 13.0);
         // expect two non-empty sections, one per span.
         assert_eq!(job.sections.len(), 2);
         let s0 = &job.text[job.sections[0].byte_range.clone()];
@@ -1768,7 +1905,7 @@ mod tests {
             style_bits: 0,
         }];
         let inline = vec![(2..4, InlineChangeKind::Insert)];
-        let job = build_layout("abcde", &syntax, &inline, Side::Right, 13.0);
+        let job = build_layout("abcde", &syntax, &inline, &[], Side::Right, 13.0);
         // boundaries: 0, 2, 4, 5 => 3 sections: "ab", "cd", "e"
         assert_eq!(job.sections.len(), 3);
         let texts: Vec<&str> = job
@@ -1787,7 +1924,7 @@ mod tests {
     fn build_layout_drops_inline_background_on_wrong_side() {
         let inline = vec![(0..3, InlineChangeKind::Insert)];
         // Insert kind on the Left side: should NOT highlight.
-        let job = build_layout("abcdef", &[], &inline, Side::Left, 13.0);
+        let job = build_layout("abcdef", &[], &inline, &[], Side::Left, 13.0);
         assert!(
             job.sections
                 .iter()
@@ -1812,7 +1949,7 @@ mod tests {
             },
         ];
         // Should not panic even though boundary 2 splits "é".
-        let _ = build_layout("héllo", &spans, &[], Side::Left, 13.0);
+        let _ = build_layout("héllo", &spans, &[], &[], Side::Left, 13.0);
     }
 
     #[test]
@@ -2130,6 +2267,39 @@ mod tests {
         // the field itself is unit-testable.
         let app = fixture("a\nb\nc\n", "a\nB\nc\n");
         assert_eq!(app.edit_scroll_y, 0.0);
+    }
+
+    #[test]
+    fn find_recomputes_on_diff_swap() {
+        let mut app = fixture("hello world\n", "hello world\n");
+        app.find.query = "world".into();
+        app.find.recompute(&app.diff.rows);
+        assert_eq!(app.find.len(), 2);
+        let mut nl = DiffDocument::empty_for("nl");
+        nl.content = "x\n".into();
+        let mut nr = DiffDocument::empty_for("nr");
+        nr.content = "y\n".into();
+        app.swap_documents(nl, nr);
+        assert_eq!(app.find.len(), 0);
+    }
+
+    #[test]
+    fn find_recomputes_after_recompute_diff() {
+        let mut app = fixture("alpha beta\n", "alpha gamma\n");
+        app.find.query = "alpha".into();
+        app.find.recompute(&app.diff.rows);
+        assert_eq!(app.find.len(), 2);
+        app.left.content = "x beta\n".into();
+        app.recompute_diff();
+        assert_eq!(app.find.len(), 1);
+    }
+
+    #[test]
+    fn find_bg_at_picks_current_over_normal() {
+        let ranges = vec![(0..5, false), (2..4, true)];
+        assert_eq!(find_bg_at(&ranges, 3), Some(theme::FIND_CURRENT_BG));
+        assert_eq!(find_bg_at(&ranges, 1), Some(theme::FIND_BG));
+        assert_eq!(find_bg_at(&ranges, 10), None);
     }
 
     #[test]
