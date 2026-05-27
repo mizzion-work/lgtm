@@ -46,8 +46,11 @@ pub struct FolderApp {
 }
 
 impl FolderApp {
-    /// Construct an app from a precomputed [`FolderDiff`].
+    /// Construct an app from a precomputed [`FolderDiff`]. Eagerly
+    /// computes per-file +N/-M stats unless the folder is huge.
     pub fn new(diff: FolderDiff) -> Self {
+        let mut diff = diff;
+        diff.compute_stats(lgtm_core::DEFAULT_STATS_MAX_FILES);
         Self {
             diff,
             filters: FolderFilters::default(),
@@ -182,6 +185,18 @@ impl eframe::App for FolderApp {
                                     RichText::new(e.relative_path.display().to_string())
                                         .monospace(),
                                 );
+                                if let (Some(ins), Some(del)) = (e.insertions, e.deletions) {
+                                    ui.label(
+                                        RichText::new(format!("  +{ins}"))
+                                            .color(Color32::from_rgb(0x55, 0xc7, 0x66))
+                                            .monospace(),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(" -{del}"))
+                                            .color(Color32::from_rgb(0xff, 0x6b, 0x6b))
+                                            .monospace(),
+                                    );
+                                }
                                 let sizes = format!(
                                     "  L={}  R={}",
                                     e.left_size
@@ -355,24 +370,32 @@ mod tests {
                 status: FolderEntryStatus::Identical,
                 left_size: Some(1),
                 right_size: Some(1),
+                insertions: None,
+                deletions: None,
             },
             FolderEntry {
                 relative_path: PathBuf::from("changed.txt"),
                 status: FolderEntryStatus::Modified,
                 left_size: Some(10),
                 right_size: Some(20),
+                insertions: None,
+                deletions: None,
             },
             FolderEntry {
                 relative_path: PathBuf::from("only_l.txt"),
                 status: FolderEntryStatus::LeftOnly,
                 left_size: Some(1),
                 right_size: None,
+                insertions: None,
+                deletions: None,
             },
             FolderEntry {
                 relative_path: PathBuf::from("only_r.txt"),
                 status: FolderEntryStatus::RightOnly,
                 left_size: None,
                 right_size: Some(1),
+                insertions: None,
+                deletions: None,
             },
         ];
         FolderApp::new(FolderDiff {

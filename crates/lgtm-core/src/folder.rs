@@ -40,6 +40,11 @@ pub struct FolderEntry {
     pub left_size: Option<u64>,
     /// Size on the right, if present.
     pub right_size: Option<u64>,
+    /// Inserted-line count when [`FolderDiff::compute_stats`] has been
+    /// run. `None` means stats were never computed for this entry.
+    pub insertions: Option<usize>,
+    /// Deleted-line count when [`FolderDiff::compute_stats`] has been run.
+    pub deletions: Option<usize>,
 }
 
 /// Result of comparing two directory trees.
@@ -119,6 +124,8 @@ impl FolderDiff {
                 status,
                 left_size: l.map(|m| m.size),
                 right_size: r.map(|m| m.size),
+                insertions: None,
+                deletions: None,
             });
         }
 
@@ -128,6 +135,71 @@ impl FolderDiff {
             entries,
         })
     }
+
+    /// Compute per-file `+N / -M` line stats for every entry that
+    /// could conceivably have a sensible value. Mutates `entries`
+    /// in place. Safe to call repeatedly; entries already populated
+    /// are not recomputed.
+    ///
+    /// - `Modified` → run a line diff and tally `insertions`/`deletions`.
+    /// - `LeftOnly` → `+0 / -line_count(left)` (everything was deleted).
+    /// - `RightOnly` → `+line_count(right) / -0`.
+    /// - `Identical` / `BinaryDiffers` / `TypeChanged` → leave as `None`.
+    ///
+    /// Skips automatically if the folder has more than `max_files`
+    /// entries to keep cost bounded.
+    pub fn compute_stats(&mut self, max_files: usize) {
+        if self.entries.len() > max_files {
+            return;
+        }
+        for entry in &mut self.entries {
+            if entry.insertions.is_some() || entry.deletions.is_some() {
+                continue;
+            }
+            match entry.status {
+                FolderEntryStatus::Modified => {
+                    let l = self.left_root.join(&entry.relative_path);
+                    let r = self.right_root.join(&entry.relative_path);
+                    let (ins, del) = diff_stats_for(&l, &r);
+                    entry.insertions = Some(ins);
+                    entry.deletions = Some(del);
+                }
+                FolderEntryStatus::LeftOnly => {
+                    let l = self.left_root.join(&entry.relative_path);
+                    let lines = line_count_of(&l);
+                    entry.insertions = Some(0);
+                    entry.deletions = Some(lines);
+                }
+                FolderEntryStatus::RightOnly => {
+                    let r = self.right_root.join(&entry.relative_path);
+                    let lines = line_count_of(&r);
+                    entry.insertions = Some(lines);
+                    entry.deletions = Some(0);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Default cap used by callers that don't pick one explicitly.
+pub const DEFAULT_STATS_MAX_FILES: usize = 500;
+
+fn diff_stats_for(left: &Path, right: &Path) -> (usize, usize) {
+    let l = std::fs::read_to_string(left).unwrap_or_default();
+    let r = std::fs::read_to_string(right).unwrap_or_default();
+    let diff = crate::AlignedDiff::compute_from_text(&l, &r);
+    // Replace counts as both an insertion and a deletion: lines changed
+    // means a left line went away and a right line appeared.
+    let ins = diff.stats.insertions + diff.stats.replacements;
+    let del = diff.stats.deletions + diff.stats.replacements;
+    (ins, del)
+}
+
+fn line_count_of(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
 fn walk(root: &Path, options: &FolderDiffOptions) -> Result<HashMap<PathBuf, EntryMeta>> {
@@ -350,5 +422,87 @@ mod tests {
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted);
+    }
+
+    // ---- compute_stats ----------------------------------------------
+
+    #[test]
+    fn compute_stats_modified_counts_inserts_and_deletes() {
+        let l = unique_dir("stats-l");
+        let r = unique_dir("stats-r");
+        write(&l.join("f.txt"), b"a\nb\nc\nd\n");
+        // +2 / -1 vs left (b dropped, X and Y added).
+        write(&r.join("f.txt"), b"a\nX\nY\nc\nd\n");
+        let mut d = FolderDiff::compute(&l, &r, &opts()).unwrap();
+        d.compute_stats(100);
+        let entry = d
+            .entries
+            .iter()
+            .find(|e| e.relative_path == Path::new("f.txt"))
+            .unwrap();
+        assert_eq!(entry.insertions, Some(2));
+        assert_eq!(entry.deletions, Some(1));
+    }
+
+    #[test]
+    fn compute_stats_left_only_is_all_deletions() {
+        let l = unique_dir("lo-l");
+        let r = unique_dir("lo-r");
+        write(&l.join("f.txt"), b"one\ntwo\nthree\n");
+        let mut d = FolderDiff::compute(&l, &r, &opts()).unwrap();
+        d.compute_stats(100);
+        let entry = &d.entries[0];
+        assert_eq!(entry.status, FolderEntryStatus::LeftOnly);
+        assert_eq!(entry.insertions, Some(0));
+        assert_eq!(entry.deletions, Some(3));
+    }
+
+    #[test]
+    fn compute_stats_right_only_is_all_insertions() {
+        let l = unique_dir("ro-l");
+        let r = unique_dir("ro-r");
+        write(&r.join("f.txt"), b"one\ntwo\n");
+        let mut d = FolderDiff::compute(&l, &r, &opts()).unwrap();
+        d.compute_stats(100);
+        let entry = &d.entries[0];
+        assert_eq!(entry.status, FolderEntryStatus::RightOnly);
+        assert_eq!(entry.insertions, Some(2));
+        assert_eq!(entry.deletions, Some(0));
+    }
+
+    #[test]
+    fn compute_stats_skips_identical_entries() {
+        let l = unique_dir("id-l");
+        let r = unique_dir("id-r");
+        write(&l.join("same.txt"), b"hello\n");
+        write(&r.join("same.txt"), b"hello\n");
+        let mut d = FolderDiff::compute(&l, &r, &opts()).unwrap();
+        d.compute_stats(100);
+        assert!(d.entries[0].insertions.is_none());
+        assert!(d.entries[0].deletions.is_none());
+    }
+
+    #[test]
+    fn compute_stats_bails_when_above_cap() {
+        let l = unique_dir("cap-l");
+        let r = unique_dir("cap-r");
+        write(&l.join("f.txt"), b"a\n");
+        write(&r.join("f.txt"), b"b\n");
+        let mut d = FolderDiff::compute(&l, &r, &opts()).unwrap();
+        d.compute_stats(0); // immediately exceed cap
+        assert!(d.entries[0].insertions.is_none());
+    }
+
+    #[test]
+    fn compute_stats_idempotent() {
+        let l = unique_dir("idem-l");
+        let r = unique_dir("idem-r");
+        write(&l.join("f.txt"), b"a\n");
+        write(&r.join("f.txt"), b"b\n");
+        let mut d = FolderDiff::compute(&l, &r, &opts()).unwrap();
+        d.compute_stats(100);
+        let first = (d.entries[0].insertions, d.entries[0].deletions);
+        d.compute_stats(100);
+        assert_eq!((d.entries[0].insertions, d.entries[0].deletions), first);
     }
 }
