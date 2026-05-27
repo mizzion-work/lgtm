@@ -854,13 +854,15 @@ impl DiffApp {
             let left_syntax = &self.cached_left_syntax;
             let left_finds_ref = &left_finds_per_line;
             let word_wrap = self.settings.word_wrap;
-            let mut left_layouter =
-                move |ui: &egui::Ui, text: &str, wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let max_w = if word_wrap { wrap } else { f32::INFINITY };
-                    let job =
-                        build_edit_layout(text, left_syntax, left_finds_ref, font_size, max_w);
-                    ui.fonts(|f| f.layout_job(job))
-                };
+            let mut left_layouter = move |ui: &egui::Ui,
+                                          text: &dyn egui::TextBuffer,
+                                          wrap: f32|
+                  -> std::sync::Arc<egui::Galley> {
+                let max_w = if word_wrap { wrap } else { f32::INFINITY };
+                let job =
+                    build_edit_layout(text.as_str(), left_syntax, left_finds_ref, font_size, max_w);
+                ui.ctx().fonts_mut(|f| f.layout_job(job))
+            };
             ui.allocate_ui_with_layout(
                 egui::vec2(left_w, total_h),
                 Layout::top_down(Align::Min),
@@ -910,13 +912,20 @@ impl DiffApp {
             let right_syntax = &self.cached_right_syntax;
             let right_finds_ref = &right_finds_per_line;
             let word_wrap_r = self.settings.word_wrap;
-            let mut right_layouter =
-                move |ui: &egui::Ui, text: &str, wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let max_w = if word_wrap_r { wrap } else { f32::INFINITY };
-                    let job =
-                        build_edit_layout(text, right_syntax, right_finds_ref, font_size, max_w);
-                    ui.fonts(|f| f.layout_job(job))
-                };
+            let mut right_layouter = move |ui: &egui::Ui,
+                                           text: &dyn egui::TextBuffer,
+                                           wrap: f32|
+                  -> std::sync::Arc<egui::Galley> {
+                let max_w = if word_wrap_r { wrap } else { f32::INFINITY };
+                let job = build_edit_layout(
+                    text.as_str(),
+                    right_syntax,
+                    right_finds_ref,
+                    font_size,
+                    max_w,
+                );
+                ui.ctx().fonts_mut(|f| f.layout_job(job))
+            };
             ui.allocate_ui_with_layout(
                 egui::vec2(right_w, total_h),
                 Layout::top_down(Align::Min),
@@ -1066,7 +1075,12 @@ impl DiffApp {
             };
             painter.rect_filled(bar, 0.0, color);
             if i == self.current_hunk {
-                painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.5, Color32::WHITE));
+                painter.rect_stroke(
+                    bar,
+                    0.0,
+                    egui::Stroke::new(1.5, Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
             }
         }
         if response.clicked() {
@@ -1090,13 +1104,14 @@ impl DiffApp {
 }
 
 impl eframe::App for DiffApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // Modifier-prefixed shortcuts (Ctrl+S, Ctrl+O, etc.) fire
         // unconditionally. Bare-letter shortcuts (n, p, e, q) only fire
         // when no widget wants keyboard input — otherwise they'd insert
         // themselves into whatever TextEdit or find-bar input the user
         // is typing in.
-        let typing = ctx.wants_keyboard_input();
+        let typing = ctx.egui_wants_keyboard_input();
         let mut delta: isize = 0;
         let mut first = false;
         let mut last = false;
@@ -1212,11 +1227,11 @@ impl eframe::App for DiffApp {
 
         // App theme picked at the top of every frame so reloads from
         // disk and runtime toggles apply consistently.
-        apply_app_theme(ctx, self.settings.app_theme);
+        apply_app_theme(&ctx, self.settings.app_theme);
 
         // Menubar (File / Edit / View / Help) sits above the title.
         let mut actions: Vec<MenuAction> = Vec::new();
-        egui::TopBottomPanel::top("lgtm-menubar").show(ctx, |ui| {
+        egui::Panel::top("lgtm-menubar").show_inside(ui, |ui| {
             let mctx = MenuContext {
                 dirty: self.is_dirty(),
                 supports_edit_mode: true,
@@ -1244,29 +1259,29 @@ impl eframe::App for DiffApp {
         }
 
         if self.find.visible {
-            egui::TopBottomPanel::top("lgtm-find").show(ctx, |ui| {
+            egui::Panel::top("lgtm-find").show_inside(ui, |ui| {
                 self.render_find_bar(ui);
             });
         }
 
-        egui::TopBottomPanel::top("lgtm-title").show(ctx, |ui| {
+        egui::Panel::top("lgtm-title").show_inside(ui, |ui| {
             ui.heading(self.title());
             self.render_toolbar(ui);
         });
-        egui::TopBottomPanel::bottom("lgtm-status").show(ctx, |ui| {
+        egui::Panel::bottom("lgtm-status").show_inside(ui, |ui| {
             self.render_status(ui);
         });
-        egui::SidePanel::right("lgtm-minimap")
-            .exact_width(20.0)
+        egui::Panel::right("lgtm-minimap")
+            .exact_size(20.0)
             .resizable(false)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 self.render_minimap(ui);
             });
         if self.git_graph_visible {
-            egui::SidePanel::right("lgtm-git-graph")
-                .default_width(360.0)
-                .min_width(200.0)
-                .show(ctx, |ui| {
+            egui::Panel::right("lgtm-git-graph")
+                .default_size(360.0)
+                .min_size(200.0)
+                .show_inside(ui, |ui| {
                     if let Some(g) = &self.git_graph {
                         crate::graph_panel::render_graph_panel(ui, g);
                     } else {
@@ -1274,25 +1289,25 @@ impl eframe::App for DiffApp {
                     }
                 });
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             self.render_diff(ui);
         });
 
         if self.show_confirm_quit {
-            self.render_confirm_quit(ctx);
+            self.render_confirm_quit(&ctx);
         }
         if self.show_about {
-            self.render_about(ctx);
+            self.render_about(&ctx);
         }
         if self.show_shortcuts {
-            self.render_shortcuts(ctx);
+            self.render_shortcuts(&ctx);
         }
         if self.pending_large_confirm.is_some() {
-            self.render_large_file_confirm(ctx);
+            self.render_large_file_confirm(&ctx);
         }
 
         // Drag-and-drop: drain any files dropped onto the window.
-        self.handle_dropped_files(ctx);
+        self.handle_dropped_files(&ctx);
     }
 }
 

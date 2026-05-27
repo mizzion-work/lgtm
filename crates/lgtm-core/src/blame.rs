@@ -263,7 +263,7 @@ fn compute_blame(repo_root: &Path, file_path: &Path) -> BlameOutcome {
             author_name: author.name().unwrap_or("").to_string(),
             author_email: author.email().unwrap_or("").to_string(),
             commit_time: git2_time_to_chrono(commit.time()),
-            summary: commit.summary().unwrap_or("").to_string(),
+            summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
         };
         for i in 0..len {
             let line_idx = start + i;

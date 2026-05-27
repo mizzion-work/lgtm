@@ -112,10 +112,11 @@ impl FolderApp {
 }
 
 impl eframe::App for FolderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        crate::diff_app::apply_app_theme(ctx, self.settings.app_theme);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        crate::diff_app::apply_app_theme(&ctx, self.settings.app_theme);
 
-        let typing = ctx.wants_keyboard_input();
+        let typing = ctx.egui_wants_keyboard_input();
         ctx.input(|i| {
             if i.key_pressed(Key::Escape) {
                 self.close_requested = true;
@@ -130,7 +131,7 @@ impl eframe::App for FolderApp {
 
         // Menubar (File / Help + theme + font; no edit/hunk/editor).
         let mut actions: Vec<MenuAction> = Vec::new();
-        egui::TopBottomPanel::top("lgtm-folder-menubar").show(ctx, |ui| {
+        egui::Panel::top("lgtm-folder-menubar").show_inside(ui, |ui| {
             let mctx = MenuContext {
                 dirty: false,
                 supports_edit_mode: false,
@@ -150,7 +151,7 @@ impl eframe::App for FolderApp {
             self.handle_menu_action(action);
         }
 
-        egui::TopBottomPanel::top("lgtm-folder-title").show(ctx, |ui| {
+        egui::Panel::top("lgtm-folder-title").show_inside(ui, |ui| {
             ui.heading(format!(
                 "lgtm — {} ↔ {}",
                 self.diff.left_root.display(),
@@ -168,7 +169,7 @@ impl eframe::App for FolderApp {
         let left_root = self.diff.left_root.clone();
         let right_root = self.diff.right_root.clone();
         let font_size = self.settings.font_size;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -259,7 +260,7 @@ impl eframe::App for FolderApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label(RichText::new(menubar::about_body()).monospace());
                     if ui.button("OK").clicked() {
                         self.show_about = false;
@@ -276,7 +277,7 @@ impl eframe::App for FolderApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label(RichText::new(menubar::shortcuts_body()).monospace());
                     if ui.button("OK").clicked() {
                         self.show_shortcuts = false;

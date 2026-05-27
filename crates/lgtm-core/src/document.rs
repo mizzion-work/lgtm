@@ -108,9 +108,13 @@ impl DiffDocument {
             });
         }
 
-        let mut detector = chardetng::EncodingDetector::new();
+        // chardetng 1.0 changed the API: constructor now takes the
+        // Iso2022Jp detection toggle, and guess() takes a Utf8Detection
+        // enum instead of a bool. We deny ISO-2022-JP (matches the
+        // browser-default posture) and allow UTF-8 as the prior bool=true.
+        let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
         detector.feed(&bytes, true);
-        let encoding = detector.guess(None, true);
+        let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
 
         let (decoded, _, _had_errors) = encoding.decode(&bytes);
         let raw = decoded.into_owned();

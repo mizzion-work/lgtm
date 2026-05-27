@@ -127,7 +127,7 @@ impl Graph {
                     .map(|s| s.to_string())
                     .unwrap_or_default(),
                 time: git2_time_to_chrono(commit.time()),
-                summary: commit.summary().unwrap_or("").to_string(),
+                summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
                 parents,
                 lane: 0,
             });

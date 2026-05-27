@@ -121,8 +121,9 @@ impl MergeApp {
 }
 
 impl eframe::App for MergeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        crate::diff_app::apply_app_theme(ctx, self.settings.app_theme);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        crate::diff_app::apply_app_theme(&ctx, self.settings.app_theme);
 
         let mut want_save = false;
         let mut want_quit = false;
@@ -148,7 +149,7 @@ impl eframe::App for MergeApp {
 
         // Menubar (File / Help — Edit/View suppressed via supports flags).
         let mut actions: Vec<MenuAction> = Vec::new();
-        egui::TopBottomPanel::top("lgtm-merge-menubar").show(ctx, |ui| {
+        egui::Panel::top("lgtm-merge-menubar").show_inside(ui, |ui| {
             let mctx = MenuContext {
                 dirty: self.merge.unresolved_conflicts() == 0,
                 supports_edit_mode: false,
@@ -168,7 +169,7 @@ impl eframe::App for MergeApp {
             self.handle_menu_action(action);
         }
 
-        egui::TopBottomPanel::top("lgtm-merge-title").show(ctx, |ui| {
+        egui::Panel::top("lgtm-merge-title").show_inside(ui, |ui| {
             ui.heading(self.title());
             ui.horizontal(|ui| {
                 let total = self.merge.total_conflicts();
@@ -184,7 +185,7 @@ impl eframe::App for MergeApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -195,13 +196,13 @@ impl eframe::App for MergeApp {
         });
 
         if self.show_confirm_unresolved {
-            self.render_confirm_unresolved(ctx);
+            self.render_confirm_unresolved(&ctx);
         }
         if self.show_confirm_abort {
-            self.render_confirm_abort(ctx);
+            self.render_confirm_abort(&ctx);
         }
         if self.save_error.is_some() {
-            self.render_save_error(ctx);
+            self.render_save_error(&ctx);
         }
         if self.show_about {
             let mut open = true;
@@ -210,7 +211,7 @@ impl eframe::App for MergeApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label(RichText::new(menubar::about_body()).monospace());
                     if ui.button("OK").clicked() {
                         self.show_about = false;
@@ -227,7 +228,7 @@ impl eframe::App for MergeApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label(RichText::new(menubar::shortcuts_body()).monospace());
                     if ui.button("OK").clicked() {
                         self.show_shortcuts = false;

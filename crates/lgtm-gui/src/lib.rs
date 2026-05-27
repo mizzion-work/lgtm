@@ -135,8 +135,8 @@ struct MergeAppWithExit {
 }
 
 impl eframe::App for MergeAppWithExit {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.inner.update(ctx, frame);
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.inner.ui(ui, frame);
         if let Some(exit) = self.inner.exit {
             *self.exit_out.lock().unwrap() = Some(exit);
         }

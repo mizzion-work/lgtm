@@ -132,16 +132,16 @@ pub fn render_menubar(
     recents: &RecentList,
     out: &mut Vec<MenuAction>,
 ) {
-    egui::menu::bar(ui, |ui| {
+    egui::MenuBar::new().ui(ui, |ui| {
         // ---- File ---------------------------------------------------
         ui.menu_button("File", |ui| {
             if shortcut_button(ui, "Open Files…", Some(&SC_OPEN)).clicked() {
                 out.push(MenuAction::OpenFiles);
-                ui.close_menu();
+                ui.close();
             }
             if shortcut_button(ui, "Open Folders…", Some(&SC_OPEN_FOLDER)).clicked() {
                 out.push(MenuAction::OpenFolders);
-                ui.close_menu();
+                ui.close();
             }
             ui.menu_button("Open Recent", |ui| {
                 if recents.is_empty() {
@@ -151,13 +151,13 @@ pub fn render_menubar(
                         let label = recent_label(entry);
                         if ui.button(label).clicked() {
                             out.push(MenuAction::OpenRecent(entry.clone()));
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     ui.separator();
                     if ui.button("Clear Recent").clicked() {
                         out.push(MenuAction::ClearRecent);
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
             });
@@ -169,13 +169,13 @@ pub fn render_menubar(
                 );
                 if save.clicked() {
                     out.push(MenuAction::Save);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
             ui.separator();
             if shortcut_button(ui, "Quit", Some(&SC_QUIT)).clicked() {
                 out.push(MenuAction::Quit);
-                ui.close_menu();
+                ui.close();
             }
         });
 
@@ -189,7 +189,7 @@ pub fn render_menubar(
                 };
                 if ui.button(label).clicked() {
                     out.push(MenuAction::ToggleEditMode);
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
             }
@@ -202,7 +202,7 @@ pub fn render_menubar(
                 .clicked()
                 {
                     out.push(MenuAction::OpenInEditor);
-                    ui.close_menu();
+                    ui.close();
                 }
                 if shortcut_button(
                     ui,
@@ -212,7 +212,7 @@ pub fn render_menubar(
                 .clicked()
                 {
                     out.push(MenuAction::OpenBothInEditor);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -228,7 +228,7 @@ pub fn render_menubar(
                 .clicked()
                 {
                     out.push(MenuAction::NextHunk);
-                    ui.close_menu();
+                    ui.close();
                 }
                 if shortcut_button(
                     ui,
@@ -238,7 +238,7 @@ pub fn render_menubar(
                 .clicked()
                 {
                     out.push(MenuAction::PrevHunk);
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 if shortcut_button(
@@ -249,7 +249,7 @@ pub fn render_menubar(
                 .clicked()
                 {
                     out.push(MenuAction::FirstHunk);
-                    ui.close_menu();
+                    ui.close();
                 }
                 if shortcut_button(
                     ui,
@@ -259,21 +259,21 @@ pub fn render_menubar(
                 .clicked()
                 {
                     out.push(MenuAction::LastHunk);
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 ui.menu_button("Font Size", |ui| {
                     if shortcut_button(ui, "Increase", Some(&SC_FONT_UP)).clicked() {
                         out.push(MenuAction::IncreaseFontSize);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if shortcut_button(ui, "Decrease", Some(&SC_FONT_DOWN)).clicked() {
                         out.push(MenuAction::DecreaseFontSize);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if shortcut_button(ui, "Reset", Some(&SC_FONT_RESET)).clicked() {
                         out.push(MenuAction::ResetFontSize);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 ui.menu_button("App Theme", |ui| {
@@ -289,7 +289,7 @@ pub fn render_menubar(
                         };
                         if ui.button(format!("{mark}{label}")).clicked() {
                             out.push(MenuAction::SetAppTheme(theme));
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                 });
@@ -302,7 +302,7 @@ pub fn render_menubar(
                         };
                         if ui.button(format!("{mark}{}", theme.label())).clicked() {
                             out.push(MenuAction::SetEditorTheme(*theme));
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                 });
@@ -314,7 +314,7 @@ pub fn render_menubar(
                 };
                 if ui.button(wrap_label).clicked() {
                     out.push(MenuAction::ToggleWordWrap);
-                    ui.close_menu();
+                    ui.close();
                 }
                 let ws_label = if ctx.ignore_whitespace {
                     "✔ Ignore Whitespace"
@@ -323,7 +323,7 @@ pub fn render_menubar(
                 };
                 if ui.button(ws_label).clicked() {
                     out.push(MenuAction::ToggleIgnoreWhitespace);
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 let graph_label = if ctx.git_graph_visible {
@@ -333,7 +333,7 @@ pub fn render_menubar(
                 };
                 if ui.button(graph_label).clicked() {
                     out.push(MenuAction::ToggleGitGraph);
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         }
@@ -342,7 +342,7 @@ pub fn render_menubar(
         ui.menu_button("Help", |ui| {
             if ui.button("Keyboard Shortcuts").clicked() {
                 out.push(MenuAction::ShowShortcuts);
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             if ui
@@ -350,7 +350,7 @@ pub fn render_menubar(
                 .clicked()
             {
                 out.push(MenuAction::ShowAbout);
-                ui.close_menu();
+                ui.close();
             }
         });
     });

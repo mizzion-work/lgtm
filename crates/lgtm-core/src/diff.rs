@@ -333,8 +333,12 @@ impl AlignedDiff {
 
     fn compute_from_text_raw(left: &str, right: &str) -> Self {
         let diff = TextDiff::from_lines(left, right);
-        let left_lines = diff.old_slices();
-        let right_lines = diff.new_slices();
+        // similar 3.x removed bulk old_slices/new_slices accessors;
+        // iter into a Vec to keep the indexing pattern.
+        let left_lines: Vec<&str> = diff.iter_old_slices().collect();
+        let right_lines: Vec<&str> = diff.iter_new_slices().collect();
+        let left_lines = left_lines.as_slice();
+        let right_lines = right_lines.as_slice();
         Self::build_from_ops(diff.ops(), left_lines, right_lines)
     }
 

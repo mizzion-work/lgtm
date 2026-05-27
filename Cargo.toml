@@ -16,7 +16,7 @@ description = "from wtf to lgtm — a cross-platform diff/merge tool"
 
 [workspace.dependencies]
 # Diff engine
-similar = "2.6"
+similar = "3"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -26,26 +26,26 @@ ignore = "0.4"
 
 # Detection
 content_inspector = "0.2"
-chardetng = "0.1"
+chardetng = "1"
 encoding_rs = "0.8"
 
 # Errors
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # GUI
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.29"
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.34"
 
 # Syntax highlighting
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 # Git operations (blame). Vendored libgit2 so end users don't need a system one.
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # Date / time arithmetic for blame display
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -54,7 +54,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
 
 # Native file dialogs (menubar "Open Files..." / "Open Folder...")
-rfd = "0.15"
+rfd = "0.17"
 
 # Internal crates
 lgtm-core = { path = "crates/lgtm-core", version = "0.1.0" }
