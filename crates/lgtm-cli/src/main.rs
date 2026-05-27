@@ -77,6 +77,18 @@ struct Cli {
     /// Only relevant in folder mode. Off by default.
     #[arg(long)]
     follow_symlinks: bool,
+
+    /// GUI backend. `eframe` (default) uses egui/eframe; `gpui` uses
+    /// Zed's gpui. Currently only the two-file diff window is wired
+    /// for the gpui backend — everything else falls through to eframe.
+    #[arg(long, default_value = "eframe")]
+    backend: GuiBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum GuiBackend {
+    Eframe,
+    Gpui,
 }
 
 fn main() -> ExitCode {
@@ -155,6 +167,14 @@ fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         return Ok(EXIT_IDENTICAL);
     }
 
+    if matches!(cli.backend, GuiBackend::Gpui) {
+        anyhow::bail!(
+            "--backend gpui is not buildable from the default workspace.\n\
+             See crates/lgtm-gui-gpui/README.md for build instructions \
+             (workspace.exclude on this branch keeps it from breaking the \
+             default cargo build)."
+        );
+    }
     let outcome = lgtm_gui::run_diff(
         left,
         right,

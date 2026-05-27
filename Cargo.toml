@@ -4,7 +4,14 @@ members = [
     "crates/lgtm-core",
     "crates/lgtm-gui",
     "crates/lgtm-cli",
+    # crates/lgtm-gui-gpui — excluded from the default workspace build
+    # because gpui's transitive deps don't currently resolve cleanly
+    # outside zed's own workspace (core-foundation =0.10.0 vs cocoa
+    # 0.26.0's req of ^0.10 → 0.10.1 conflict). Sources are kept under
+    # `crates/lgtm-gui-gpui/` as the migration scaffold; see that
+    # crate's README for the path to a working build.
 ]
+exclude = ["crates/lgtm-gui-gpui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -55,6 +62,14 @@ regex = "1"
 
 # Native file dialogs (menubar "Open Files..." / "Open Folder...")
 rfd = "0.17"
+
+# gpui — Zed's GPU-accelerated UI framework. Pulled from the Zed monorepo
+# because the crates.io publish of gpui depends on gpui_platform which
+# isn't published separately. Only consumed by the excluded lgtm-gui-gpui
+# crate (see workspace.exclude above); this entry exists so the
+# scaffolded crate's manifest stays valid for human readers.
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "e25458243bb5f3522fd56c12d16d145e44395053", default-features = false, features = ["x11", "wayland"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "e25458243bb5f3522fd56c12d16d145e44395053" }
 
 # Internal crates
 lgtm-core = { path = "crates/lgtm-core", version = "0.1.0" }

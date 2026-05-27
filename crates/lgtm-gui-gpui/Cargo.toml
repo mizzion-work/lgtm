@@ -1,0 +1,15 @@
+[package]
+name = "lgtm-gui-gpui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gpui-based GUI for lgtm (parallel backend to lgtm-gui)."
+
+[dependencies]
+lgtm-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
