@@ -28,7 +28,8 @@ pub mod highlight;
 pub mod merge;
 
 pub use diff::{
-    AlignedDiff, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange, InlineChangeKind, Side,
+    unified_diff, AlignedDiff, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange,
+    InlineChangeKind, Side,
 };
 pub use document::{DiffDocument, LineEnding};
 pub use error::{Error, Result};

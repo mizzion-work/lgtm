@@ -282,6 +282,28 @@ impl AlignedDiff {
     }
 }
 
+/// Render a unified-diff between two strings, used by `lgtm --no-gui`.
+///
+/// `context_radius` is the number of unchanged lines kept around each hunk
+/// (matching `diff -u`'s default of 3).
+pub fn unified_diff(
+    left: &str,
+    right: &str,
+    left_label: &str,
+    right_label: &str,
+    context_radius: usize,
+) -> String {
+    let diff = TextDiff::from_lines(left, right);
+    let mut out = format!("--- {left_label}\n+++ {right_label}\n");
+    out.push_str(
+        &diff
+            .unified_diff()
+            .context_radius(context_radius)
+            .to_string(),
+    );
+    out
+}
+
 fn compute_inline(left: &str, right: &str) -> Vec<InlineChange> {
     let diff = TextDiff::from_words(left, right);
     let mut left_pos = 0usize;
