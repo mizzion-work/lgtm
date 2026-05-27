@@ -1,9 +1,13 @@
 //! Two-file diff window.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
-use lgtm_core::{AlignedDiff, DiffDocument, DiffRow, HunkKind, InlineChangeKind, Side};
+use lgtm_core::{
+    AlignedDiff, DiffDocument, DiffRow, Highlighter, HunkKind, InlineChangeKind, Side, StyledSpan,
+    SyntectHighlighter,
+};
 
 use crate::theme;
 
@@ -37,16 +41,43 @@ pub struct DiffApp {
     pending_scroll: Option<usize>,
     /// Wall-clock time of the most recent edit; resets after debounce fires.
     last_edit_at: Option<Instant>,
+    /// Shared highlighter (cheap to clone — its assets are a global OnceLock).
+    highlighter: Arc<dyn Highlighter>,
+    /// Per-line styled spans for the left pane, keyed by 0-based line index.
+    cached_left_syntax: Vec<Vec<StyledSpan>>,
+    /// Per-line styled spans for the right pane, keyed by 0-based line index.
+    cached_right_syntax: Vec<Vec<StyledSpan>>,
 }
 
 impl DiffApp {
     /// Construct an app from already-loaded documents and a precomputed diff.
+    /// Uses the default [`SyntectHighlighter`] (dark theme); call
+    /// [`DiffApp::with_highlighter`] to override (mostly useful for tests).
     pub fn new(
         left: DiffDocument,
         right: DiffDocument,
         diff: AlignedDiff,
         read_only: bool,
     ) -> Self {
+        Self::with_highlighter(
+            left,
+            right,
+            diff,
+            read_only,
+            Arc::new(SyntectHighlighter::dark()),
+        )
+    }
+
+    /// Construct an app with a custom [`Highlighter`].
+    pub fn with_highlighter(
+        left: DiffDocument,
+        right: DiffDocument,
+        diff: AlignedDiff,
+        read_only: bool,
+        highlighter: Arc<dyn Highlighter>,
+    ) -> Self {
+        let cached_left_syntax = highlighter.highlight_document(&hint_for(&left), &left.content);
+        let cached_right_syntax = highlighter.highlight_document(&hint_for(&right), &right.content);
         Self {
             left,
             right,
@@ -60,7 +91,20 @@ impl DiffApp {
             show_confirm_quit: false,
             pending_scroll: None,
             last_edit_at: None,
+            highlighter,
+            cached_left_syntax,
+            cached_right_syntax,
         }
+    }
+
+    /// Refresh the cached syntax spans for both panes from current content.
+    pub fn refresh_highlights(&mut self) {
+        self.cached_left_syntax = self
+            .highlighter
+            .highlight_document(&hint_for(&self.left), &self.left.content);
+        self.cached_right_syntax = self
+            .highlighter
+            .highlight_document(&hint_for(&self.right), &self.right.content);
     }
 
     /// True if either side has been edited since the last save.
@@ -91,6 +135,7 @@ impl DiffApp {
         if self.current_hunk >= self.diff.hunks.len() {
             self.current_hunk = self.diff.hunks.len().saturating_sub(1);
         }
+        self.refresh_highlights();
     }
 
     fn mark_edited(&mut self, side: Side) {
@@ -260,10 +305,13 @@ impl DiffApp {
             // Place the target row a third of the way down the viewport.
             scroll = scroll.vertical_scroll_offset((row as f32 * row_height) - 60.0);
         }
+        let diff = &self.diff;
+        let left_syntax = &self.cached_left_syntax;
+        let right_syntax = &self.cached_right_syntax;
         scroll.show_rows(ui, row_height, total, |ui, row_range| {
             ui.style_mut().override_font_id = Some(FontId::monospace(13.0));
             for idx in row_range {
-                render_row(ui, &self.diff.rows[idx], row_height);
+                render_row(ui, &diff.rows[idx], row_height, left_syntax, right_syntax);
             }
         });
     }
@@ -460,7 +508,13 @@ fn render_binary_stub(ui: &mut egui::Ui, left: &DiffDocument, right: &DiffDocume
     });
 }
 
-fn render_row(ui: &mut egui::Ui, row: &DiffRow, row_height: f32) {
+fn render_row(
+    ui: &mut egui::Ui,
+    row: &DiffRow,
+    row_height: f32,
+    left_syntax: &[Vec<StyledSpan>],
+    right_syntax: &[Vec<StyledSpan>],
+) {
     let bg = row_background(row);
     let avail = ui.available_width();
     let half = (avail - 8.0) * 0.5;
@@ -477,6 +531,14 @@ fn render_row(ui: &mut egui::Ui, row: &DiffRow, row_height: f32) {
     );
 
     let parts = decompose(row);
+    let left_spans = parts
+        .left_num
+        .and_then(|n| left_syntax.get(n.saturating_sub(1)).map(|v| v.as_slice()))
+        .unwrap_or(&[]);
+    let right_spans = parts
+        .right_num
+        .and_then(|n| right_syntax.get(n.saturating_sub(1)).map(|v| v.as_slice()))
+        .unwrap_or(&[]);
 
     render_pane(
         &mut child,
@@ -485,6 +547,7 @@ fn render_row(ui: &mut egui::Ui, row: &DiffRow, row_height: f32) {
         parts.left_text,
         Side::Left,
         &parts.inline_left,
+        left_spans,
     );
     child.add(egui::Separator::default().vertical().spacing(8.0));
     render_pane(
@@ -494,6 +557,7 @@ fn render_row(ui: &mut egui::Ui, row: &DiffRow, row_height: f32) {
         parts.right_text,
         Side::Right,
         &parts.inline_right,
+        right_spans,
     );
 }
 
@@ -515,6 +579,7 @@ fn render_pane(
     text: &str,
     side: Side,
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
+    syntax: &[StyledSpan],
 ) {
     ui.scope(|ui| {
         ui.set_max_width(width);
@@ -524,67 +589,99 @@ fn render_pane(
                 None => " ".repeat(theme::GUTTER_WIDTH_CHARS),
             };
             ui.label(RichText::new(gutter).color(theme::GUTTER_FG).monospace());
-            if inline.is_empty() {
-                ui.label(RichText::new(strip_nl(text)).monospace());
-            } else {
-                render_inline_text(ui, text, inline, side);
-            }
+            let layout = build_layout(strip_nl(text), syntax, inline, side);
+            ui.label(layout);
         });
     });
 }
 
-fn render_inline_text(
-    ui: &mut egui::Ui,
-    text: &str,
+/// Build a [`LayoutJob`] for one displayed line that combines syntax
+/// foregrounds (from `syntax`) and inline-change backgrounds (from `inline`).
+///
+/// The two span sets are independently produced (syntect vs. similar) so we
+/// walk a sorted union of their boundaries and emit one segment per gap.
+fn build_layout(
+    display: &str,
+    syntax: &[StyledSpan],
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
     side: Side,
-) {
-    let mut layout = egui::text::LayoutJob::default();
-    let display = strip_nl(text);
+) -> egui::text::LayoutJob {
+    let font = FontId::monospace(13.0);
+    let mut job = egui::text::LayoutJob::default();
+    if display.is_empty() {
+        return job;
+    }
+
     let display_len = display.len();
-    let mut cursor = 0usize;
-    for (range, kind) in inline {
-        let start = range.start.min(display_len);
-        let end = range.end.min(display_len);
-        if start > cursor {
-            layout.append(
-                &display[cursor..start],
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::monospace(13.0),
-                    ..Default::default()
-                },
-            );
+    let mut boundaries: Vec<usize> = vec![0, display_len];
+    for s in syntax {
+        boundaries.push(s.range.start.min(display_len));
+        boundaries.push(s.range.end.min(display_len));
+    }
+    for (r, _) in inline {
+        boundaries.push(r.start.min(display_len));
+        boundaries.push(r.end.min(display_len));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    for window in boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if start >= end {
+            continue;
         }
-        let want_highlight = matches!(
-            (kind, side),
-            (InlineChangeKind::Delete, Side::Left) | (InlineChangeKind::Insert, Side::Right)
-        );
+        // Avoid splitting in the middle of a multi-byte UTF-8 codepoint.
+        if !display.is_char_boundary(start) || !display.is_char_boundary(end) {
+            continue;
+        }
+        let fg = syntax_fg_at(syntax, start);
+        let bg = inline_bg_at(inline, side, start);
         let fmt = egui::TextFormat {
-            font_id: FontId::monospace(13.0),
-            background: if want_highlight {
-                theme::INLINE_BG
-            } else {
-                Color32::TRANSPARENT
-            },
+            font_id: font.clone(),
+            color: fg,
+            background: bg,
             ..Default::default()
         };
-        if end > start {
-            layout.append(&display[start..end], 0.0, fmt);
+        job.append(&display[start..end], 0.0, fmt);
+    }
+    job
+}
+
+fn syntax_fg_at(spans: &[StyledSpan], pos: usize) -> Color32 {
+    for s in spans {
+        if s.range.contains(&pos) {
+            let r = ((s.rgb >> 16) & 0xff) as u8;
+            let g = ((s.rgb >> 8) & 0xff) as u8;
+            let b = (s.rgb & 0xff) as u8;
+            // syntect occasionally returns black (#000000) for unstyled
+            // regions in light themes; treat as "use default".
+            if r == 0 && g == 0 && b == 0 {
+                return Color32::PLACEHOLDER;
+            }
+            return Color32::from_rgb(r, g, b);
         }
-        cursor = end;
     }
-    if cursor < display_len {
-        layout.append(
-            &display[cursor..],
-            0.0,
-            egui::TextFormat {
-                font_id: FontId::monospace(13.0),
-                ..Default::default()
-            },
-        );
+    Color32::PLACEHOLDER
+}
+
+fn inline_bg_at(
+    spans: &[(std::ops::Range<usize>, InlineChangeKind)],
+    side: Side,
+    pos: usize,
+) -> Color32 {
+    for (range, kind) in spans {
+        if range.contains(&pos) {
+            let want_highlight = matches!(
+                (kind, side),
+                (InlineChangeKind::Delete, Side::Left) | (InlineChangeKind::Insert, Side::Right)
+            );
+            if want_highlight {
+                return theme::INLINE_BG;
+            }
+        }
     }
-    ui.label(layout);
+    Color32::TRANSPARENT
 }
 
 fn row_background(row: &DiffRow) -> Color32 {
@@ -665,6 +762,16 @@ fn strip_nl(s: &str) -> &str {
     s.strip_suffix('\n').unwrap_or(s)
 }
 
+/// Pick a language hint (file extension, lowercased, no dot) for a document.
+/// Empty string means "let the highlighter fall back to plain text".
+fn hint_for(doc: &DiffDocument) -> String {
+    doc.path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 fn short_path(p: &std::path::Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -697,7 +804,9 @@ mod tests {
         let mut r = DiffDocument::empty_for("r");
         r.content = right.into();
         let diff = lgtm_core::AlignedDiff::compute(&l, &r);
-        DiffApp::new(l, r, diff, false)
+        // Tests use the Noop highlighter to avoid loading syntect's
+        // default assets — it shaves ~100 ms off each test run.
+        DiffApp::with_highlighter(l, r, diff, false, Arc::new(lgtm_core::NoopHighlighter))
     }
 
     #[test]
@@ -770,6 +879,113 @@ mod tests {
         assert!(!app.modified_left);
         let written = std::fs::read(&lpath).unwrap();
         assert_eq!(written, b"a\nBB\n");
+    }
+
+    #[test]
+    fn hint_for_picks_lowercase_extension() {
+        let mut d = DiffDocument::empty_for("/tmp/foo.RS");
+        d.content = "x".into();
+        assert_eq!(hint_for(&d), "rs");
+    }
+
+    #[test]
+    fn hint_for_returns_empty_when_no_extension() {
+        let d = DiffDocument::empty_for("/tmp/Makefile");
+        assert_eq!(hint_for(&d), "");
+    }
+
+    #[test]
+    fn build_layout_handles_empty_text() {
+        let job = build_layout("", &[], &[], Side::Left);
+        assert!(job.sections.is_empty());
+    }
+
+    #[test]
+    fn build_layout_with_only_syntax_splits_at_span_boundaries() {
+        let spans = vec![
+            StyledSpan {
+                range: 0..2,
+                rgb: 0xff0000,
+                style_bits: 0,
+            },
+            StyledSpan {
+                range: 2..5,
+                rgb: 0x00ff00,
+                style_bits: 0,
+            },
+        ];
+        let job = build_layout("abcde", &spans, &[], Side::Left);
+        // expect two non-empty sections, one per span.
+        assert_eq!(job.sections.len(), 2);
+        let s0 = &job.text[job.sections[0].byte_range.clone()];
+        let s1 = &job.text[job.sections[1].byte_range.clone()];
+        assert_eq!(s0, "ab");
+        assert_eq!(s1, "cde");
+    }
+
+    #[test]
+    fn build_layout_combines_syntax_and_inline_boundaries() {
+        let syntax = vec![StyledSpan {
+            range: 0..5,
+            rgb: 0xff0000,
+            style_bits: 0,
+        }];
+        let inline = vec![(2..4, InlineChangeKind::Insert)];
+        let job = build_layout("abcde", &syntax, &inline, Side::Right);
+        // boundaries: 0, 2, 4, 5 => 3 sections: "ab", "cd", "e"
+        assert_eq!(job.sections.len(), 3);
+        let texts: Vec<&str> = job
+            .sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(texts, vec!["ab", "cd", "e"]);
+        // The middle section should carry the inline background (right side
+        // + Insert kind triggers highlight).
+        assert_eq!(job.sections[1].format.background, theme::INLINE_BG);
+        assert_eq!(job.sections[0].format.background, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn build_layout_drops_inline_background_on_wrong_side() {
+        let inline = vec![(0..3, InlineChangeKind::Insert)];
+        // Insert kind on the Left side: should NOT highlight.
+        let job = build_layout("abcdef", &[], &inline, Side::Left);
+        assert!(
+            job.sections
+                .iter()
+                .all(|s| s.format.background == Color32::TRANSPARENT)
+        );
+    }
+
+    #[test]
+    fn build_layout_respects_utf8_boundaries() {
+        // "héllo" — the é is 2 bytes (0xc3 0xa9). A span ending at byte 2
+        // would split the character; build_layout must skip that segment.
+        let spans = vec![
+            StyledSpan {
+                range: 0..2,
+                rgb: 0xff0000,
+                style_bits: 0,
+            },
+            StyledSpan {
+                range: 2..6,
+                rgb: 0x00ff00,
+                style_bits: 0,
+            },
+        ];
+        // Should not panic even though boundary 2 splits "é".
+        let _ = build_layout("héllo", &spans, &[], Side::Left);
+    }
+
+    #[test]
+    fn recompute_diff_refreshes_syntax_caches() {
+        let mut app = fixture("a\nb\n", "a\nb\n");
+        let before_len = app.cached_left_syntax.len();
+        app.left.content = "a\nb\nc\nd\n".into();
+        app.recompute_diff();
+        assert_eq!(app.cached_left_syntax.len(), 4);
+        assert!(app.cached_left_syntax.len() > before_len);
     }
 
     #[test]

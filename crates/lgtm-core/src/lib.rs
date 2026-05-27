@@ -34,5 +34,8 @@ pub use diff::{
 pub use document::{DiffDocument, HARD_SIZE_LIMIT, LineEnding, SOFT_SIZE_LIMIT};
 pub use error::{Error, Result};
 pub use folder::{FolderDiff, FolderDiffOptions, FolderEntry, FolderEntryStatus};
-pub use highlight::{Highlighter, NoopHighlighter};
+pub use highlight::{
+    Highlighter, NoopHighlighter, STYLE_BOLD, STYLE_ITALIC, STYLE_UNDERLINE, StyledSpan,
+    SyntectHighlighter,
+};
 pub use merge::{MergeRegion, ThreeWayMerge};

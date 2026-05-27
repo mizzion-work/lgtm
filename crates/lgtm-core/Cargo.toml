@@ -13,5 +13,6 @@ ignore.workspace = true
 content_inspector.workspace = true
 chardetng.workspace = true
 encoding_rs.workspace = true
+syntect.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

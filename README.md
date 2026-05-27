@@ -19,6 +19,8 @@ first-class support for use as `git difftool` and `git mergetool`.
 - **Two-file diff** with side-by-side synchronized scrolling, word-level
   highlighting inside replaced lines, hunk navigation, and a clickable
   minimap of all changes.
+- **Syntax highlighting** via `syntect` for any of its bundled
+  languages; picked by file extension and re-applied after each edit.
 - **Live editing** of either pane with a 150 ms debounced re-diff;
   Ctrl+S saves back to disk preserving the original encoding and line
   endings.
