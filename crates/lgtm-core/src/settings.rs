@@ -53,9 +53,10 @@ impl AppTheme {
 /// Which syntect theme paints the source code in the diff view. A few
 /// bundled themes are surfaced explicitly; anything else falls through
 /// to the syntect default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum EditorTheme {
     /// `base16-eighties.dark` — dark, vibrant. Default.
+    #[default]
     EightiesDark,
     /// `base16-mocha.dark` — dark, warm.
     MochaDark,
@@ -113,12 +114,6 @@ impl EditorTheme {
 
     fn parse(s: &str) -> Option<Self> {
         Self::all().iter().copied().find(|t| t.syntect_name() == s)
-    }
-}
-
-impl Default for EditorTheme {
-    fn default() -> Self {
-        EditorTheme::EightiesDark
     }
 }
 

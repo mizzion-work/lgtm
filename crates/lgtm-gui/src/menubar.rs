@@ -55,6 +55,8 @@ pub enum MenuAction {
     SetAppTheme(AppTheme),
     /// Switch the syntect theme used to color source code.
     SetEditorTheme(EditorTheme),
+    /// Toggle the git-graph drawer.
+    ToggleGitGraph,
 }
 
 /// What state the host window can do at the moment. Drives whether items
@@ -77,6 +79,8 @@ pub struct MenuContext {
     pub app_theme: AppTheme,
     /// Currently-selected editor theme (highlighted with a check in the menu).
     pub editor_theme: EditorTheme,
+    /// `true` if the git-graph drawer is currently visible.
+    pub git_graph_visible: bool,
 }
 
 impl Default for MenuContext {
@@ -90,6 +94,7 @@ impl Default for MenuContext {
             read_only: false,
             app_theme: AppTheme::Auto,
             editor_theme: EditorTheme::default(),
+            git_graph_visible: false,
         }
     }
 }
@@ -291,6 +296,16 @@ pub fn render_menubar(
                         }
                     }
                 });
+                ui.separator();
+                let graph_label = if ctx.git_graph_visible {
+                    "✔ Show Git Graph"
+                } else {
+                    "   Show Git Graph"
+                };
+                if ui.button(graph_label).clicked() {
+                    out.push(MenuAction::ToggleGitGraph);
+                    ui.close_menu();
+                }
             });
         }
 

@@ -39,6 +39,18 @@ first-class support for use as `git difftool` and `git mergetool`.
   of the last 10 pairs from **File → Open Recent** (persisted to
   `~/.config/lgtm/recent.tsv` by default; override with
   `$LGTM_CONFIG_DIR`), pop About + Keyboard Shortcuts modals.
+- **Find** (`Ctrl+F`) — case-insensitive plain-text search over both
+  panes with `N of M` counter, ◀/▶ buttons, and Enter / Shift+Enter
+  to step through matches. The current match is brightly tinted.
+- **Adjustable font size** (`Ctrl+=` / `Ctrl+-` / `Ctrl+0`), and
+  **themes** for both the program chrome (Auto / Light / Dark) and
+  the editor (seven syntect-bundled palettes). Both persisted to
+  `~/.config/lgtm/settings.tsv`.
+- **Synchronized edit-mode scrolling** — the two `TextEdit`s share a
+  scroll offset; scroll one and the other catches up.
+- **Git graph drawer** (View → Show Git Graph) — last 200 commits with
+  branch lanes, dots, author, short SHA, and summary. Loaded lazily on
+  first reveal so startup stays fast.
 - **Three-way merge** built for `git mergetool`. Each conflict gets
   Take LOCAL / Take REMOTE / Take BOTH (either order) / Take BASE
   buttons and an editable per-conflict resolution. Saving with

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense};
 use lgtm_core::{
     AlignedDiff, AppTheme, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, FindState,
-    Highlighter, HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Settings, Side,
-    StyledSpan, SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
+    Graph, Highlighter, HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Settings,
+    Side, StyledSpan, SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
 };
 
 use crate::menubar::{self, MenuAction, MenuContext};
@@ -118,6 +118,10 @@ pub struct DiffApp {
     /// Whenever the find bar opens we want the input box focused — set
     /// here and consumed by the next render frame.
     find_focus_pending: bool,
+    /// Git-graph drawer visibility.
+    pub git_graph_visible: bool,
+    /// Cached Graph, lazily loaded on first reveal of the drawer.
+    git_graph: Option<Graph>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +191,8 @@ impl DiffApp {
             pending_open: None,
             find: FindState::default(),
             find_focus_pending: false,
+            git_graph_visible: false,
+            git_graph: None,
         }
     }
 
@@ -291,7 +297,21 @@ impl DiffApp {
                 let _ = self.settings.save();
                 self.apply_editor_theme();
             }
+            MenuAction::ToggleGitGraph => {
+                self.git_graph_visible = !self.git_graph_visible;
+                if self.git_graph_visible && self.git_graph.is_none() {
+                    self.git_graph = Some(self.load_git_graph());
+                }
+            }
         }
+    }
+
+    /// Build the git graph from `repo_root` if set, falling back to
+    /// `self.left.path`'s parent so the drawer "just works" when the
+    /// user opened a file that lives in a working tree.
+    fn load_git_graph(&self) -> Graph {
+        let start = self.repo_root.as_deref().unwrap_or(&self.left.path);
+        Graph::build(start).unwrap_or_default()
     }
 
     /// Rebuild the highlighter from the current editor-theme setting and
@@ -1039,6 +1059,7 @@ impl eframe::App for DiffApp {
                 read_only: self.read_only,
                 app_theme: self.settings.app_theme,
                 editor_theme: self.settings.editor_theme,
+                git_graph_visible: self.git_graph_visible,
             };
             crate::menubar::render_menubar(ui, mctx, &self.recents, &mut actions);
         });
@@ -1072,6 +1093,18 @@ impl eframe::App for DiffApp {
             .show(ctx, |ui| {
                 self.render_minimap(ui);
             });
+        if self.git_graph_visible {
+            egui::SidePanel::right("lgtm-git-graph")
+                .default_width(360.0)
+                .min_width(200.0)
+                .show(ctx, |ui| {
+                    if let Some(g) = &self.git_graph {
+                        crate::graph_panel::render_graph_panel(ui, g);
+                    } else {
+                        ui.label("(loading graph…)");
+                    }
+                });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_diff(ui);
         });
@@ -2346,6 +2379,20 @@ mod tests {
         assert_eq!(app.settings.app_theme, lgtm_core::AppTheme::Dark);
         app.handle_menu_action(MenuAction::SetAppTheme(lgtm_core::AppTheme::Light));
         assert_eq!(app.settings.app_theme, lgtm_core::AppTheme::Light);
+    }
+
+    #[test]
+    fn handle_menu_action_toggle_git_graph_flips_visibility() {
+        let mut app = fixture("a\n", "b\n");
+        assert!(!app.git_graph_visible);
+        app.handle_menu_action(MenuAction::ToggleGitGraph);
+        assert!(app.git_graph_visible);
+        // Loaded a (possibly empty) Graph eagerly on first reveal.
+        assert!(app.git_graph.is_some());
+        app.handle_menu_action(MenuAction::ToggleGitGraph);
+        assert!(!app.git_graph_visible);
+        // Graph cache persists across toggle so re-show is instant.
+        assert!(app.git_graph.is_some());
     }
 
     #[test]

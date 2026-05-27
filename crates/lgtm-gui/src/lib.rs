@@ -17,6 +17,7 @@ use lgtm_core::{AlignedDiff, DiffDocument, EditorLauncher, FolderDiff, ThreeWayM
 
 mod diff_app;
 mod folder_app;
+mod graph_panel;
 mod menubar;
 mod merge_app;
 mod theme;

@@ -29,6 +29,7 @@ pub mod editor;
 pub mod error;
 pub mod find;
 pub mod folder;
+pub mod graph;
 pub mod highlight;
 pub mod merge;
 pub mod recent;
@@ -44,6 +45,7 @@ pub use editor::{EditorLauncher, LineArgStyle, resolve_real_path};
 pub use error::{Error, Result};
 pub use find::{FindMatch, FindState, find_matches};
 pub use folder::{FolderDiff, FolderDiffOptions, FolderEntry, FolderEntryStatus};
+pub use graph::{CommitNode, Graph, GraphEdge, MAX_COMMITS};
 pub use highlight::{
     Highlighter, NoopHighlighter, STYLE_BOLD, STYLE_ITALIC, STYLE_UNDERLINE, StyledSpan,
     SyntectHighlighter,
