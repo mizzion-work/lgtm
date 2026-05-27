@@ -1,0 +1,20 @@
+[package]
+name = "lgtm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The lgtm binary — argument parsing and dispatch."
+
+[[bin]]
+name = "lgtm"
+path = "src/main.rs"
+
+[dependencies]
+lgtm-core.workspace = true
+lgtm-gui.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
