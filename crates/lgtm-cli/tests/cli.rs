@@ -108,11 +108,28 @@ fn no_gui_binary_files_print_short_message() {
 }
 
 #[test]
-fn version_prints_something() {
+fn version_prints_ascii_banner_and_tagline() {
     let out = Command::new(bin()).arg("--version").output().unwrap();
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("lgtm"));
+    assert!(s.contains("╦  ╔═╗╔╦╗╔╦╗"));
+    assert!(s.contains("from wtf to lgtm"));
+}
+
+#[test]
+fn quiet_suppresses_lgtm_banner() {
+    let a = tmp("q_a.txt", b"x\n");
+    let b = tmp("q_b.txt", b"x\n");
+    let out = Command::new(bin())
+        .args(["--no-gui", "--quiet"])
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    // --quiet currently affects the GUI path; --no-gui identical exits
+    // silently regardless. Sanity check there's no "LGTM" emission either.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("LGTM ✓"));
 }
 
 #[test]

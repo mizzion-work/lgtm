@@ -10,12 +10,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use lgtm_core::{DiffDocument, FolderDiff, FolderDiffOptions, ThreeWayMerge, unified_diff};
+use lgtm_core::{
+    DiffDocument, FolderDiff, FolderDiffOptions, SOFT_SIZE_LIMIT, ThreeWayMerge, unified_diff,
+};
 use lgtm_gui::GuiOutcome;
 
 const EXIT_IDENTICAL: u8 = 0;
 const EXIT_DIFFERS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
+
+const VERSION_BANNER: &str = "  ╦  ╔═╗╔╦╗╔╦╗
+  ║  ║ ╦ ║ ║║║
+  ╩═╝╚═╝ ╩ ╩ ╩
+  from wtf to lgtm — v";
 
 /// `lgtm` — from wtf to lgtm.
 #[derive(Debug, Parser)]
@@ -62,6 +69,14 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .try_init();
 
+    // Custom --version banner. We pre-parse before clap so the user sees
+    // the lgtm ASCII art instead of the default crate-version line.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{VERSION_BANNER}{}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::from(0);
+    }
+
     let cli = Cli::parse();
     match dispatch(cli) {
         Ok(code) => ExitCode::from(code),
@@ -96,6 +111,8 @@ fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         return dispatch_folder(&cli.left, &right_path, cli.no_gui, cli.quiet);
     }
 
+    warn_if_large(&cli.left);
+    warn_if_large(&right_path);
     let left = DiffDocument::load(&cli.left)?;
     let right = DiffDocument::load(&right_path)?;
 
@@ -295,6 +312,18 @@ fn dispatch_folder(left: &Path, right: &Path, no_gui: bool, quiet: bool) -> anyh
 
 fn is_dir(p: &Path) -> bool {
     std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+fn warn_if_large(p: &Path) {
+    if let Ok(m) = std::fs::metadata(p) {
+        if m.is_file() && m.len() > SOFT_SIZE_LIMIT {
+            eprintln!(
+                "lgtm: warning: {} is {} MB; loading may take a while",
+                p.display(),
+                m.len() / (1024 * 1024)
+            );
+        }
+    }
 }
 
 fn emit_lgtm(quiet: bool) {
