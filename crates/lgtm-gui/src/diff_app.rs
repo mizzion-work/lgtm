@@ -1,9 +1,14 @@
 //! Two-file diff window.
 
+use std::time::{Duration, Instant};
+
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
 use lgtm_core::{AlignedDiff, DiffDocument, DiffRow, HunkKind, InlineChangeKind, Side};
 
 use crate::theme;
+
+/// Recompute the diff after this much idle time once an edit has landed.
+const DIFF_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// The egui app driving the two-file diff window.
 pub struct DiffApp {
@@ -19,8 +24,19 @@ pub struct DiffApp {
     pub current_hunk: usize,
     /// Set when the user presses `Esc` or closes the window.
     pub close_requested: bool,
+    /// Edit-mode toggle. View mode (default) shows rendered diff;
+    /// edit mode swaps to two TextEdits.
+    pub edit_mode: bool,
+    /// Whether the left pane has unsaved changes.
+    pub modified_left: bool,
+    /// Whether the right pane has unsaved changes.
+    pub modified_right: bool,
+    /// Show a confirm-on-quit modal.
+    pub show_confirm_quit: bool,
     /// Request a scroll-to-row on the next frame.
     pending_scroll: Option<usize>,
+    /// Wall-clock time of the most recent edit; resets after debounce fires.
+    last_edit_at: Option<Instant>,
 }
 
 impl DiffApp {
@@ -38,8 +54,51 @@ impl DiffApp {
             read_only,
             current_hunk: 0,
             close_requested: false,
+            edit_mode: false,
+            modified_left: false,
+            modified_right: false,
+            show_confirm_quit: false,
             pending_scroll: None,
+            last_edit_at: None,
         }
+    }
+
+    /// True if either side has been edited since the last save.
+    pub fn is_dirty(&self) -> bool {
+        self.modified_left || self.modified_right
+    }
+
+    /// Save any modified panes back to their original paths.
+    /// Encoding and line-ending restoration is handled by [`DiffDocument::save_to`].
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        if self.modified_left {
+            let p = self.left.path.clone();
+            self.left.save_to(p)?;
+            self.modified_left = false;
+        }
+        if self.modified_right {
+            let p = self.right.path.clone();
+            self.right.save_to(p)?;
+            self.modified_right = false;
+        }
+        Ok(())
+    }
+
+    /// Recompute the diff from current pane contents. Cheap enough that we
+    /// just call it once the debounce window expires.
+    pub fn recompute_diff(&mut self) {
+        self.diff = AlignedDiff::compute(&self.left, &self.right).with_inline();
+        if self.current_hunk >= self.diff.hunks.len() {
+            self.current_hunk = self.diff.hunks.len().saturating_sub(1);
+        }
+    }
+
+    fn mark_edited(&mut self, side: Side) {
+        match side {
+            Side::Left => self.modified_left = true,
+            Side::Right => self.modified_right = true,
+        }
+        self.last_edit_at = Some(Instant::now());
     }
 
     /// Move the current hunk by `delta`, wrapping at the ends.
@@ -73,8 +132,9 @@ impl DiffApp {
     }
 
     fn title(&self) -> String {
+        let dirty = if self.is_dirty() { "* " } else { "" };
         format!(
-            "lgtm — {} ↔ {}",
+            "{dirty}lgtm — {} ↔ {}",
             short_path(&self.left.path),
             short_path(&self.right.path)
         )
@@ -111,7 +171,81 @@ impl DiffApp {
         });
     }
 
+    fn render_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if !self.read_only
+                && ui
+                    .button(if self.edit_mode { "View" } else { "Edit" })
+                    .clicked()
+            {
+                self.edit_mode = !self.edit_mode;
+            }
+            if !self.read_only {
+                let save_enabled = self.is_dirty();
+                let resp = ui.add_enabled(save_enabled, egui::Button::new("Save (Ctrl+S)"));
+                if resp.clicked() {
+                    if let Err(e) = self.save() {
+                        tracing::error!("save failed: {e}");
+                    }
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(if self.edit_mode { "edit" } else { "view" });
+            });
+        });
+    }
+
+    fn render_edit_panes(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        let half = (avail.x - 8.0) * 0.5;
+        ui.horizontal_top(|ui| {
+            let left_resp = ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
+                ScrollArea::vertical()
+                    .id_salt("lgtm-edit-left")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut self.left.content)
+                                .font(FontId::monospace(13.0))
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(40)
+                                .interactive(!self.read_only),
+                        );
+                        if resp.changed() {
+                            self.mark_edited(Side::Left);
+                        }
+                    });
+            });
+            let _ = left_resp;
+            ui.separator();
+            let right_resp = ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
+                ScrollArea::vertical()
+                    .id_salt("lgtm-edit-right")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut self.right.content)
+                                .font(FontId::monospace(13.0))
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(40)
+                                .interactive(!self.read_only),
+                        );
+                        if resp.changed() {
+                            self.mark_edited(Side::Right);
+                        }
+                    });
+            });
+            let _ = right_resp;
+        });
+    }
+
     fn render_diff(&mut self, ui: &mut egui::Ui) {
+        if self.edit_mode {
+            self.render_edit_panes(ui);
+            return;
+        }
         if self.left.is_binary || self.right.is_binary {
             render_binary_stub(ui, &self.left, &self.right);
             return;
@@ -182,27 +316,42 @@ impl DiffApp {
 
 impl eframe::App for DiffApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keyboard shortcuts.
+        // Keyboard shortcuts. Hunk-nav keys are inactive in edit mode so
+        // they don't fight with the TextEdit consuming `n` / `p`.
         let mut delta: isize = 0;
         let mut first = false;
         let mut last = false;
+        let mut want_save = false;
         ctx.input(|i| {
-            if i.key_pressed(Key::Escape) || i.key_pressed(Key::Q) {
+            if i.modifiers.command_only() && i.key_pressed(Key::S) {
+                want_save = true;
+            }
+            if i.key_pressed(Key::Escape) {
                 self.close_requested = true;
             }
-            if i.key_pressed(Key::N) {
-                delta = 1;
-            }
-            if i.key_pressed(Key::P) {
-                delta = -1;
-            }
-            if i.modifiers.ctrl && i.key_pressed(Key::Home) {
-                first = true;
-            }
-            if i.modifiers.ctrl && i.key_pressed(Key::End) {
-                last = true;
+            if !self.edit_mode {
+                if i.key_pressed(Key::Q) {
+                    self.close_requested = true;
+                }
+                if i.key_pressed(Key::N) {
+                    delta = 1;
+                }
+                if i.key_pressed(Key::P) {
+                    delta = -1;
+                }
+                if i.modifiers.ctrl && i.key_pressed(Key::Home) {
+                    first = true;
+                }
+                if i.modifiers.ctrl && i.key_pressed(Key::End) {
+                    last = true;
+                }
             }
         });
+        if want_save {
+            if let Err(e) = self.save() {
+                tracing::error!("save failed: {e}");
+            }
+        }
         if delta != 0 {
             self.jump_hunk(delta);
         }
@@ -214,11 +363,29 @@ impl eframe::App for DiffApp {
         }
 
         if self.close_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if self.is_dirty() {
+                self.show_confirm_quit = true;
+                self.close_requested = false;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        // Debounced re-diff: if enough idle time has passed since the last
+        // edit, refresh the diff state and clear the timer.
+        if let Some(t) = self.last_edit_at {
+            if t.elapsed() >= DIFF_DEBOUNCE {
+                self.recompute_diff();
+                self.last_edit_at = None;
+            } else {
+                // Wake the UI up when the debounce expires.
+                ctx.request_repaint_after(DIFF_DEBOUNCE - t.elapsed());
+            }
         }
 
         egui::TopBottomPanel::top("lgtm-title").show(ctx, |ui| {
             ui.heading(self.title());
+            self.render_toolbar(ui);
         });
         egui::TopBottomPanel::bottom("lgtm-status").show(ctx, |ui| {
             self.render_status(ui);
@@ -232,6 +399,46 @@ impl eframe::App for DiffApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_diff(ui);
         });
+
+        if self.show_confirm_quit {
+            self.render_confirm_quit(ctx);
+        }
+    }
+}
+
+impl DiffApp {
+    fn render_confirm_quit(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("You have unsaved changes. What now?");
+                ui.horizontal(|ui| {
+                    if ui.button("Save and quit").clicked() {
+                        if let Err(e) = self.save() {
+                            tracing::error!("save failed: {e}");
+                        } else {
+                            self.show_confirm_quit = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    if ui.button("Quit without saving").clicked() {
+                        self.show_confirm_quit = false;
+                        self.modified_left = false;
+                        self.modified_right = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_confirm_quit = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_confirm_quit = false;
+        }
     }
 }
 
@@ -516,6 +723,53 @@ mod tests {
         app.jump_last();
         // shouldn't crash, no pending scroll
         assert!(app.pending_scroll.is_none());
+    }
+
+    #[test]
+    fn mark_edited_sets_dirty_and_timer() {
+        let mut app = fixture("a\n", "a\n");
+        assert!(!app.is_dirty());
+        app.mark_edited(Side::Left);
+        assert!(app.modified_left);
+        assert!(!app.modified_right);
+        assert!(app.is_dirty());
+        assert!(app.last_edit_at.is_some());
+    }
+
+    #[test]
+    fn recompute_diff_after_edit_clamps_current_hunk() {
+        let mut app = fixture("a\nb\nc\nd\n", "X\nb\nY\nd\n");
+        assert_eq!(app.diff.hunks.len(), 2);
+        app.current_hunk = 1;
+        // Now mutate to a single-hunk state and recompute.
+        app.left.content = "a\nb\n".into();
+        app.right.content = "X\nb\n".into();
+        app.recompute_diff();
+        assert_eq!(app.diff.hunks.len(), 1);
+        assert_eq!(app.current_hunk, 0, "current_hunk must be clamped");
+    }
+
+    #[test]
+    fn save_round_trips_edited_content() {
+        let dir = std::env::temp_dir().join("lgtm-edit-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lpath = dir.join("save_l.txt");
+        let rpath = dir.join("save_r.txt");
+        std::fs::write(&lpath, b"a\nb\n").unwrap();
+        std::fs::write(&rpath, b"a\nB\n").unwrap();
+
+        let l = DiffDocument::load(&lpath).unwrap();
+        let r = DiffDocument::load(&rpath).unwrap();
+        let diff = lgtm_core::AlignedDiff::compute(&l, &r);
+        let mut app = DiffApp::new(l, r, diff, false);
+
+        app.left.content = "a\nBB\n".into();
+        app.modified_left = true;
+        app.save().unwrap();
+
+        assert!(!app.modified_left);
+        let written = std::fs::read(&lpath).unwrap();
+        assert_eq!(written, b"a\nBB\n");
     }
 
     #[test]
