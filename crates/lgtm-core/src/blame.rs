@@ -95,18 +95,26 @@ fn plural(n: i64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// Internal mutex-protected state. Cloneable handles via `Arc` so the
+/// background loader thread can write back while the UI thread reads.
+#[derive(Default)]
+struct BlameInner {
+    loaded: HashMap<(PathBuf, PathBuf), Vec<Option<BlameInfo>>>,
+    misses: std::collections::HashSet<(PathBuf, PathBuf)>,
+    /// Files for which a background load is currently in flight. Lets
+    /// `request` no-op on the second hover before the first finishes
+    /// and lets the UI render a "loading…" state.
+    loading: std::collections::HashSet<(PathBuf, PathBuf)>,
+}
+
 /// Cache of blame data keyed by `(repo_root, file_path)`.
 ///
-/// Hold one instance per [`DiffApp`](crate) (one for each window). Cache
-/// entries are `Vec<Option<BlameInfo>>` indexed by 1-based line number;
-/// `None` means we have no blame for that line (committed-file boundary,
-/// untracked addition, etc.).
-#[derive(Default)]
+/// Hold one instance per [`DiffApp`](crate) (one for each window).
+/// Internally uses `Arc<Mutex<_>>` so [`BlameCache::request`] can hand
+/// the cache to a background thread for non-blocking loads.
+#[derive(Default, Clone)]
 pub struct BlameCache {
-    inner: HashMap<(PathBuf, PathBuf), Vec<Option<BlameInfo>>>,
-    /// Files we tried but couldn't blame. Distinguished from "never tried"
-    /// so we don't re-hit libgit2 every hover.
-    misses: std::collections::HashSet<(PathBuf, PathBuf)>,
+    inner: std::sync::Arc<std::sync::Mutex<BlameInner>>,
 }
 
 impl BlameCache {
@@ -115,116 +123,156 @@ impl BlameCache {
         Self::default()
     }
 
-    /// Load blame for `file_path` (interpreted relative to `repo_root`).
-    ///
-    /// Returns `Ok(())` even when blame isn't available; the cache stays
-    /// empty for that file and [`BlameCache::get`] returns `None`. Only
-    /// genuine errors (corrupt repo, IO failures) propagate.
-    ///
-    /// Subsequent calls for the same key are no-ops.
-    pub fn load(&mut self, repo_root: &Path, file_path: &Path) -> Result<()> {
+    /// Synchronous load — blocks until blame is computed. Used by tests
+    /// and any caller that wants a deterministic result; the GUI uses
+    /// [`Self::request`] instead so the UI thread stays responsive.
+    pub fn load(&self, repo_root: &Path, file_path: &Path) -> Result<()> {
         let key = (repo_root.to_path_buf(), file_path.to_path_buf());
-        if self.inner.contains_key(&key) || self.misses.contains(&key) {
-            return Ok(());
-        }
-
-        // Routine "not in a repo" cases are silent.
-        let repo = match git2::Repository::discover(repo_root) {
-            Ok(r) => r,
-            Err(_) => {
-                self.misses.insert(key);
-                return Ok(());
-            }
-        };
-        let workdir = match repo.workdir() {
-            Some(w) => w.to_path_buf(),
-            None => {
-                self.misses.insert(key);
-                return Ok(());
-            }
-        };
-
-        // Resolve `file_path` to a workdir-relative path. Try the literal
-        // strip first, then canonicalize both sides if that fails.
-        let relative = resolve_relative(&workdir, file_path).map(PathBuf::from);
-        let Some(relative) = relative else {
-            self.misses.insert(key);
-            return Ok(());
-        };
-
-        // Refuse very large files to keep hover latency bounded.
-        let abs = workdir.join(&relative);
-        if let Ok(meta) = std::fs::metadata(&abs) {
-            if meta.len() > (BLAME_LINE_CAP as u64) * 256 {
-                // 256B/line upper estimate; gate before reading
-                self.misses.insert(key);
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.loaded.contains_key(&key) || inner.misses.contains(&key) {
                 return Ok(());
             }
         }
-
-        let line_count = std::fs::read_to_string(&abs)
-            .ok()
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
-        if line_count == 0 || line_count > BLAME_LINE_CAP {
-            self.misses.insert(key);
-            return Ok(());
-        }
-
-        let blame = match repo.blame_file(&relative, None) {
-            Ok(b) => b,
-            Err(_) => {
-                self.misses.insert(key);
-                return Ok(());
-            }
-        };
-
-        // 1-indexed: index 0 is a sentinel padding entry, so lookups can
-        // pass line numbers straight through.
-        let mut per_line: Vec<Option<BlameInfo>> = vec![None; line_count + 1];
-        for hunk in blame.iter() {
-            let start = hunk.final_start_line(); // 1-indexed
-            let len = hunk.lines_in_hunk();
-            let oid = hunk.final_commit_id();
-            let commit = match repo.find_commit(oid) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let author = commit.author();
-            let info = BlameInfo {
-                commit_sha: oid.to_string(),
-                author_name: author.name().unwrap_or("").to_string(),
-                author_email: author.email().unwrap_or("").to_string(),
-                commit_time: git2_time_to_chrono(commit.time()),
-                summary: commit.summary().unwrap_or("").to_string(),
-            };
-            for i in 0..len {
-                let line_idx = start + i;
-                if line_idx < per_line.len() {
-                    per_line[line_idx] = Some(info.clone());
-                }
-            }
-        }
-
-        self.inner.insert(key, per_line);
+        let outcome = compute_blame(&key.0, &key.1);
+        self.commit_outcome(key, outcome);
         Ok(())
+    }
+
+    /// Non-blocking load: spawn a worker thread (if one isn't already
+    /// running for this key) and call `on_ready` when the cache state
+    /// for this key changes. The GUI passes a closure that captures
+    /// `egui::Context::request_repaint` so the tooltip refreshes once
+    /// blame is available.
+    pub fn request<F>(&self, repo_root: &Path, file_path: &Path, on_ready: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let key = (repo_root.to_path_buf(), file_path.to_path_buf());
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.loaded.contains_key(&key)
+                || inner.misses.contains(&key)
+                || inner.loading.contains(&key)
+            {
+                return;
+            }
+            inner.loading.insert(key.clone());
+        }
+        let cache = self.clone();
+        std::thread::Builder::new()
+            .name(format!("lgtm-blame-{}", key.1.display()))
+            .spawn(move || {
+                let outcome = compute_blame(&key.0, &key.1);
+                {
+                    let mut inner = cache.inner.lock().unwrap();
+                    inner.loading.remove(&key);
+                }
+                cache.commit_outcome(key, outcome);
+                on_ready();
+            })
+            .ok();
+    }
+
+    fn commit_outcome(&self, key: (PathBuf, PathBuf), outcome: BlameOutcome) {
+        let mut inner = self.inner.lock().unwrap();
+        match outcome {
+            BlameOutcome::Loaded(spans) => {
+                inner.loaded.insert(key, spans);
+            }
+            BlameOutcome::Miss => {
+                inner.misses.insert(key);
+            }
+        }
     }
 
     /// Look up blame for `line` (1-indexed). Returns `None` if the file
     /// hasn't been loaded or the line is out of range.
-    pub fn get(&self, repo_root: &Path, file_path: &Path, line: usize) -> Option<&BlameInfo> {
+    pub fn get(&self, repo_root: &Path, file_path: &Path, line: usize) -> Option<BlameInfo> {
+        let inner = self.inner.lock().unwrap();
         let key = (repo_root.to_path_buf(), file_path.to_path_buf());
-        self.inner
+        inner
+            .loaded
             .get(&key)
             .and_then(|v| v.get(line))
-            .and_then(|opt| opt.as_ref())
+            .and_then(|opt| opt.clone())
     }
 
-    /// Whether `load` has been attempted (successfully or not) for this file.
-    pub fn was_attempted(&self, repo_root: &Path, file_path: &Path) -> bool {
+    /// `true` while a background load is in flight for this key.
+    pub fn is_loading(&self, repo_root: &Path, file_path: &Path) -> bool {
+        let inner = self.inner.lock().unwrap();
         let key = (repo_root.to_path_buf(), file_path.to_path_buf());
-        self.inner.contains_key(&key) || self.misses.contains(&key)
+        inner.loading.contains(&key)
     }
+
+    /// Whether `load`/`request` has been attempted (successfully or not).
+    pub fn was_attempted(&self, repo_root: &Path, file_path: &Path) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let key = (repo_root.to_path_buf(), file_path.to_path_buf());
+        inner.loaded.contains_key(&key) || inner.misses.contains(&key)
+    }
+}
+
+/// Outcome of a blame computation — internal to the load pipeline.
+enum BlameOutcome {
+    Loaded(Vec<Option<BlameInfo>>),
+    Miss,
+}
+
+/// The pure blame computation, free of cache locks. Safe to call from
+/// any thread; only touches git2 and the filesystem.
+fn compute_blame(repo_root: &Path, file_path: &Path) -> BlameOutcome {
+    let Ok(repo) = git2::Repository::discover(repo_root) else {
+        return BlameOutcome::Miss;
+    };
+    let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
+        return BlameOutcome::Miss;
+    };
+    let Some(relative) = resolve_relative(&workdir, file_path).map(PathBuf::from) else {
+        return BlameOutcome::Miss;
+    };
+    let abs = workdir.join(&relative);
+    if let Ok(meta) = std::fs::metadata(&abs) {
+        if meta.len() > (BLAME_LINE_CAP as u64) * 256 {
+            return BlameOutcome::Miss;
+        }
+    }
+    let line_count = std::fs::read_to_string(&abs)
+        .ok()
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    if line_count == 0 || line_count > BLAME_LINE_CAP {
+        return BlameOutcome::Miss;
+    }
+    let blame = match repo.blame_file(&relative, None) {
+        Ok(b) => b,
+        Err(_) => return BlameOutcome::Miss,
+    };
+    let mut per_line: Vec<Option<BlameInfo>> = vec![None; line_count + 1];
+    for hunk in blame.iter() {
+        let start = hunk.final_start_line();
+        let len = hunk.lines_in_hunk();
+        let oid = hunk.final_commit_id();
+        let commit = match repo.find_commit(oid) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let author = commit.author();
+        let info = BlameInfo {
+            commit_sha: oid.to_string(),
+            author_name: author.name().unwrap_or("").to_string(),
+            author_email: author.email().unwrap_or("").to_string(),
+            commit_time: git2_time_to_chrono(commit.time()),
+            summary: commit.summary().unwrap_or("").to_string(),
+        };
+        for i in 0..len {
+            let line_idx = start + i;
+            if line_idx < per_line.len() {
+                per_line[line_idx] = Some(info.clone());
+            }
+        }
+    }
+    BlameOutcome::Loaded(per_line)
 }
 
 fn resolve_relative(workdir: &Path, file_path: &Path) -> Option<String> {
@@ -390,7 +438,7 @@ mod tests {
         let dir = unique_repo("non-repo");
         let file = dir.join("foo.txt");
         std::fs::write(&file, "hello\n").unwrap();
-        let mut cache = BlameCache::new();
+        let cache = BlameCache::new();
         cache.load(&dir, &file).unwrap();
         assert!(cache.get(&dir, &file, 1).is_none());
         assert!(cache.was_attempted(&dir, &file));
@@ -408,7 +456,7 @@ mod tests {
         git(&dir, &["config", "user.name", "Alice"]);
         let file = dir.join("untracked.txt");
         std::fs::write(&file, "one\ntwo\n").unwrap();
-        let mut cache = BlameCache::new();
+        let cache = BlameCache::new();
         cache.load(&dir, &file).unwrap();
         assert!(cache.get(&dir, &file, 1).is_none());
     }
@@ -459,7 +507,7 @@ mod tests {
         .trim()
         .to_string();
 
-        let mut cache = BlameCache::new();
+        let cache = BlameCache::new();
         cache.load(&dir, &file).unwrap();
 
         let l1 = cache.get(&dir, &file, 1).expect("line 1 has blame");
@@ -489,7 +537,7 @@ mod tests {
         git(&dir, &["add", "a.txt"]);
         git(&dir, &["commit", "-q", "-m", "x"]);
 
-        let mut cache = BlameCache::new();
+        let cache = BlameCache::new();
         cache.load(&dir, &file).unwrap();
         assert!(cache.get(&dir, &file, 1).is_some());
         assert!(cache.get(&dir, &file, 9999).is_none());
@@ -511,7 +559,7 @@ mod tests {
         git(&dir, &["add", "a.txt"]);
         git(&dir, &["commit", "-q", "-m", "x"]);
 
-        let mut cache = BlameCache::new();
+        let cache = BlameCache::new();
         cache.load(&dir, &file).unwrap();
         // Second call should be a cheap no-op (no panic, no duplication).
         cache.load(&dir, &file).unwrap();
@@ -527,5 +575,82 @@ mod tests {
                 .is_none()
         );
         assert!(!cache.was_attempted(Path::new("/nowhere"), Path::new("nope.txt")));
+    }
+
+    #[test]
+    fn request_loads_in_background_and_calls_on_ready() {
+        if !have_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = unique_repo("async");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "a@b"]);
+        git(&dir, &["config", "user.name", "A"]);
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        let cache = BlameCache::new();
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_clone = ready.clone();
+        cache.request(&dir, &file, move || {
+            ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // Spin until the worker finishes (with a generous timeout).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.load(std::sync::atomic::Ordering::SeqCst),
+            "on_ready never fired"
+        );
+        assert!(cache.get(&dir, &file, 1).is_some());
+        assert!(!cache.is_loading(&dir, &file));
+    }
+
+    #[test]
+    fn duplicate_request_does_not_spawn_a_second_thread() {
+        if !have_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = unique_repo("dup");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "a@b"]);
+        git(&dir, &["config", "user.name", "A"]);
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        let cache = BlameCache::new();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..5 {
+            let c = counter.clone();
+            cache.request(&dir, &file, move || {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        // Wait for the (single) worker to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !cache.is_loading(&dir, &file) && cache.was_attempted(&dir, &file) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 4 of the 5 requests no-op'd (loading set already had the key); the
+        // remaining 1 fired and called on_ready exactly once.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "expected exactly one on_ready callback"
+        );
     }
 }

@@ -970,7 +970,8 @@ impl DiffApp {
         let diff = &self.diff;
         let left_syntax = &self.cached_left_syntax;
         let right_syntax = &self.cached_right_syntax;
-        let blame_cache = &mut self.blame_cache;
+        let blame_cache = self.blame_cache.clone();
+        let blame_ctx = ui.ctx().clone();
         let left_path = self.left.path.clone();
         let right_path = self.right.path.clone();
         let repo_root = self.repo_root.clone();
@@ -991,7 +992,8 @@ impl DiffApp {
                     row_height,
                     left_syntax,
                     right_syntax,
-                    blame_cache,
+                    &blame_cache,
+                    &blame_ctx,
                     repo_root.as_deref(),
                     &left_path,
                     &right_path,
@@ -1415,7 +1417,8 @@ fn render_row_with_blame(
     row_height: f32,
     left_syntax: &[Vec<StyledSpan>],
     right_syntax: &[Vec<StyledSpan>],
-    blame_cache: &mut BlameCache,
+    blame_cache: &BlameCache,
+    blame_ctx: &egui::Context,
     repo_root: Option<&std::path::Path>,
     left_path: &std::path::Path,
     right_path: &std::path::Path,
@@ -1512,16 +1515,23 @@ fn render_row_with_blame(
             }
             let line = line.unwrap();
             let root = repo_root.unwrap_or(file);
-            // Lazy load. Silent failure: if blame isn't available, we just
-            // don't show a tooltip.
-            let _ = blame_cache.load(root, file);
-            let info = blame_cache.get(root, file, line).cloned();
+            // Async load — non-blocking. The worker thread requests a
+            // repaint when the blame is ready so the next frame's
+            // hover renders the real tooltip.
+            let ctx_for_ready = blame_ctx.clone();
+            blame_cache.request(root, file, move || ctx_for_ready.request_repaint());
+            let info = blame_cache.get(root, file, line);
+            let loading = info.is_none() && blame_cache.is_loading(root, file);
             *hover_focus = Some(HoverFocus {
                 side,
                 line: Some(line),
                 blame: info.clone(),
                 blame_modified: false,
             });
+            if loading {
+                resp.on_hover_text("loading blame…");
+                return;
+            }
             if let Some(info) = info {
                 let now = chrono::Local::now().fixed_offset();
                 let tooltip = format!(
