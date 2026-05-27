@@ -126,6 +126,21 @@ pub struct DiffApp {
     pub git_graph_visible: bool,
     /// Cached Graph, lazily loaded on first reveal of the drawer.
     git_graph: Option<Graph>,
+    /// Pending "this file is X MB, load anyway?" prompt.
+    pending_large_confirm: Option<PendingLargeFile>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLargeFile {
+    /// Files we'd load into the panes if the user confirms. Two entries
+    /// means a swap; one entry means replace a single side.
+    files: Vec<(PendingTarget, std::path::PathBuf, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTarget {
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +213,7 @@ impl DiffApp {
             find_focus_pending: false,
             git_graph_visible: false,
             git_graph: None,
+            pending_large_confirm: None,
         }
     }
 
@@ -350,25 +366,7 @@ impl DiffApp {
 
     fn open_recent(&mut self, entry: RecentEntry) {
         match entry.mode {
-            RecentMode::File => {
-                let l = match DiffDocument::load(&entry.left) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.editor_status =
-                            Some(format!("Could not open {}: {e}", entry.left.display()));
-                        return;
-                    }
-                };
-                let r = match DiffDocument::load(&entry.right) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.editor_status =
-                            Some(format!("Could not open {}: {e}", entry.right.display()));
-                        return;
-                    }
-                };
-                self.swap_documents(l, r);
-            }
+            RecentMode::File => self.try_open_pair(entry.left, entry.right),
             RecentMode::Folder => self.spawn_folder_window(&entry.left, &entry.right),
         }
     }
@@ -1289,6 +1287,12 @@ impl eframe::App for DiffApp {
         if self.show_shortcuts {
             self.render_shortcuts(ctx);
         }
+        if self.pending_large_confirm.is_some() {
+            self.render_large_file_confirm(ctx);
+        }
+
+        // Drag-and-drop: drain any files dropped onto the window.
+        self.handle_dropped_files(ctx);
     }
 }
 
@@ -1310,23 +1314,7 @@ impl DiffApp {
                     Some(p) => p,
                     None => return,
                 };
-                let l = match DiffDocument::load(&left) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.editor_status =
-                            Some(format!("Could not open {}: {e}", left.display()));
-                        return;
-                    }
-                };
-                let r = match DiffDocument::load(&right) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.editor_status =
-                            Some(format!("Could not open {}: {e}", right.display()));
-                        return;
-                    }
-                };
-                self.swap_documents(l, r);
+                self.try_open_pair(left, right);
             }
             OpenRequest::Folders => {
                 let left = match rfd::FileDialog::new()
@@ -1344,6 +1332,168 @@ impl DiffApp {
                     None => return,
                 };
                 self.spawn_folder_window(&left, &right);
+            }
+        }
+    }
+
+    /// Attempt to open a (left, right) file pair, gating on the
+    /// large-file confirm dialog when either side is over the soft
+    /// size limit. If neither side is large, loads + swaps immediately.
+    fn try_open_pair(&mut self, left: std::path::PathBuf, right: std::path::PathBuf) {
+        let left_size = std::fs::metadata(&left).map(|m| m.len()).unwrap_or(0);
+        let right_size = std::fs::metadata(&right).map(|m| m.len()).unwrap_or(0);
+        if left_size > lgtm_core::SOFT_SIZE_LIMIT || right_size > lgtm_core::SOFT_SIZE_LIMIT {
+            self.pending_large_confirm = Some(PendingLargeFile {
+                files: vec![
+                    (PendingTarget::Left, left, left_size),
+                    (PendingTarget::Right, right, right_size),
+                ],
+            });
+            return;
+        }
+        self.load_pair_now(left, right);
+    }
+
+    /// Replace a single pane with a new file. Used by drag-and-drop
+    /// when one file is dropped (Shift = right pane; otherwise left).
+    fn try_open_single(&mut self, target: PendingTarget, path: std::path::PathBuf) {
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size > lgtm_core::SOFT_SIZE_LIMIT {
+            self.pending_large_confirm = Some(PendingLargeFile {
+                files: vec![(target, path, size)],
+            });
+            return;
+        }
+        self.load_single_now(target, path);
+    }
+
+    fn load_pair_now(&mut self, left: std::path::PathBuf, right: std::path::PathBuf) {
+        let l = match DiffDocument::load(&left) {
+            Ok(d) => d,
+            Err(e) => {
+                self.editor_status = Some(format!("Could not open {}: {e}", left.display()));
+                return;
+            }
+        };
+        let r = match DiffDocument::load(&right) {
+            Ok(d) => d,
+            Err(e) => {
+                self.editor_status = Some(format!("Could not open {}: {e}", right.display()));
+                return;
+            }
+        };
+        self.swap_documents(l, r);
+    }
+
+    fn load_single_now(&mut self, target: PendingTarget, path: std::path::PathBuf) {
+        let doc = match DiffDocument::load(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.editor_status = Some(format!("Could not open {}: {e}", path.display()));
+                return;
+            }
+        };
+        match target {
+            PendingTarget::Left => {
+                self.left = doc;
+            }
+            PendingTarget::Right => {
+                self.right = doc;
+            }
+        }
+        self.modified_left = false;
+        self.modified_right = false;
+        self.recompute_diff();
+    }
+
+    /// Drain any files dropped onto the window this frame.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let paths: Vec<std::path::PathBuf> = dropped.into_iter().filter_map(|f| f.path).collect();
+        // Partition into files and dirs.
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for p in paths {
+            match std::fs::metadata(&p) {
+                Ok(m) if m.is_dir() => dirs.push(p),
+                Ok(_) => files.push(p),
+                Err(_) => {}
+            }
+        }
+        match (files.len(), dirs.len()) {
+            (2, 0) => {
+                let mut it = files.into_iter();
+                let l = it.next().unwrap();
+                let r = it.next().unwrap();
+                self.try_open_pair(l, r);
+            }
+            (1, 0) => {
+                let target = if shift {
+                    PendingTarget::Right
+                } else {
+                    PendingTarget::Left
+                };
+                self.try_open_single(target, files.into_iter().next().unwrap());
+            }
+            (0, 2) => {
+                let mut it = dirs.into_iter();
+                let l = it.next().unwrap();
+                let r = it.next().unwrap();
+                self.spawn_folder_window(&l, &r);
+            }
+            _ => {
+                self.editor_status = Some("Drop exactly 2 files (or 2 folders) to compare".into());
+            }
+        }
+    }
+
+    fn render_large_file_confirm(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_large_confirm.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Large file")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("One or more files exceed the soft size limit (50 MB):");
+                for (_, path, size) in &pending.files {
+                    let mb = (*size as f64) / (1024.0 * 1024.0);
+                    if *size > lgtm_core::SOFT_SIZE_LIMIT {
+                        ui.label(format!("  • {} ({:.1} MB)", path.display(), mb));
+                    }
+                }
+                ui.label(RichText::new("Loading may take a while.").color(theme::GUTTER_FG));
+                ui.horizontal(|ui| {
+                    if ui.button("Load anyway").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if !open {
+            decision = Some(false);
+        }
+        if let Some(ok) = decision {
+            self.pending_large_confirm = None;
+            if ok {
+                if pending.files.len() == 2 {
+                    let mut it = pending.files.into_iter();
+                    let (_, l, _) = it.next().unwrap();
+                    let (_, r, _) = it.next().unwrap();
+                    self.load_pair_now(l, r);
+                } else if let Some((target, path, _)) = pending.files.into_iter().next() {
+                    self.load_single_now(target, path);
+                }
             }
         }
     }
