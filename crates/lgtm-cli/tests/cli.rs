@@ -108,6 +108,25 @@ fn no_gui_binary_files_print_short_message() {
 }
 
 #[test]
+fn no_gui_accepts_repo_and_editor_flags_without_complaint() {
+    // The new flags must parse cleanly even when --no-gui won't use them.
+    let a = tmp("rfl_a.txt", b"hi\n");
+    let b = tmp("rfl_b.txt", b"hi\n");
+    let out = Command::new(bin())
+        .args(["--no-gui", "--repo", "/tmp", "--editor", "echo"])
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn version_prints_ascii_banner_and_tagline() {
     let out = Command::new(bin()).arg("--version").output().unwrap();
     assert!(out.status.success());

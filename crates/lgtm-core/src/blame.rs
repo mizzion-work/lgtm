@@ -327,15 +327,42 @@ mod tests {
             summary: "s".into(),
         };
         assert_eq!(info.relative_to(then), "just now");
-        assert_eq!(info.relative_to(then + chrono::Duration::seconds(30)), "just now");
-        assert_eq!(info.relative_to(then + chrono::Duration::minutes(1)), "1 minute ago");
-        assert_eq!(info.relative_to(then + chrono::Duration::minutes(5)), "5 minutes ago");
-        assert_eq!(info.relative_to(then + chrono::Duration::hours(1)), "1 hour ago");
-        assert_eq!(info.relative_to(then + chrono::Duration::hours(5)), "5 hours ago");
-        assert_eq!(info.relative_to(then + chrono::Duration::days(1)), "yesterday");
-        assert_eq!(info.relative_to(then + chrono::Duration::days(3)), "3 days ago");
-        assert_eq!(info.relative_to(then + chrono::Duration::days(90)), "3 months ago");
-        assert_eq!(info.relative_to(then + chrono::Duration::days(800)), "2 years ago");
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::seconds(30)),
+            "just now"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::minutes(1)),
+            "1 minute ago"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::minutes(5)),
+            "5 minutes ago"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::hours(1)),
+            "1 hour ago"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::hours(5)),
+            "5 hours ago"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::days(1)),
+            "yesterday"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::days(3)),
+            "3 days ago"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::days(90)),
+            "3 months ago"
+        );
+        assert_eq!(
+            info.relative_to(then + chrono::Duration::days(800)),
+            "2 years ago"
+        );
     }
 
     #[test]

@@ -58,6 +58,20 @@ struct Cli {
     /// Suppress the "LGTM ✓" banner on successful exit.
     #[arg(long)]
     quiet: bool,
+
+    /// Working-tree root for blame lookups and editor-target resolution.
+    /// Typically `$(git rev-parse --show-toplevel)` in the git-difftool
+    /// config snippet. When set, lgtm uses it to look up blame for
+    /// difftool temp files and to open the real working-tree file
+    /// (not the temp snapshot) when the user presses `e`.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Editor command for the `e` keybinding. Overrides $LGTM_EDITOR,
+    /// $VISUAL, and $EDITOR. Use a quoted string for flags, e.g.
+    /// `--editor "open -t"`.
+    #[arg(long)]
+    editor: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -130,7 +144,13 @@ fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         return Ok(EXIT_IDENTICAL);
     }
 
-    let outcome = lgtm_gui::run_diff(left, right, cli.read_only)?;
+    let outcome = lgtm_gui::run_diff(
+        left,
+        right,
+        cli.read_only,
+        cli.repo.clone(),
+        cli.editor.as_deref(),
+    )?;
     match outcome {
         GuiOutcome::Identical => {
             emit_lgtm(cli.quiet);

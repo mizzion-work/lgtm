@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use lgtm_core::{AlignedDiff, DiffDocument, FolderDiff, ThreeWayMerge};
+use lgtm_core::{AlignedDiff, DiffDocument, EditorLauncher, FolderDiff, ThreeWayMerge};
 
 mod diff_app;
 mod folder_app;
@@ -35,10 +35,17 @@ pub enum GuiOutcome {
 ///
 /// Identical files short-circuit without opening a window. The window blocks
 /// the calling thread until the user dismisses it.
+///
+/// `repo` is the working-tree root for blame and editor-target resolution
+/// (typically passed by the user via `--repo "$(git rev-parse --show-toplevel)"`
+/// in their git-difftool config). `editor` overrides the env-var-driven
+/// editor resolution.
 pub fn run_diff(
     left: DiffDocument,
     right: DiffDocument,
     read_only: bool,
+    repo: Option<PathBuf>,
+    editor: Option<&str>,
 ) -> anyhow::Result<GuiOutcome> {
     // Binary-vs-binary or differing-sizes short circuit: still open the
     // window so the user can see the "Binary files differ" stub.
@@ -49,7 +56,16 @@ pub fn run_diff(
     };
 
     let diff = AlignedDiff::compute(&left, &right).with_inline();
-    let app = DiffApp::new(left, right, diff, read_only);
+    let mut app = DiffApp::new(left, right, diff, read_only);
+    if let Some(repo) = repo {
+        app = app.with_repo(repo);
+    }
+    // Editor resolution is best-effort: a missing editor only matters
+    // when the user actually presses `e`, so don't fail the window.
+    match EditorLauncher::resolve(editor) {
+        Ok(launcher) => app = app.with_editor(launcher),
+        Err(e) => tracing::debug!("editor unresolved at startup: {e}"),
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

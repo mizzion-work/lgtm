@@ -17,12 +17,15 @@
 //! All public types live in this skeleton with documented signatures; the
 //! implementations land in the steps that follow.
 
-#![forbid(unsafe_code)]
+// `unsafe` is denied by default; opt back in per-module (currently only
+// `editor` needs it, for `setsid()` and Rust 2024's unsafe `env::set_var`).
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod blame;
 pub mod diff;
 pub mod document;
+pub mod editor;
 pub mod error;
 pub mod folder;
 pub mod highlight;
@@ -34,6 +37,7 @@ pub use diff::{
     unified_diff,
 };
 pub use document::{DiffDocument, HARD_SIZE_LIMIT, LineEnding, SOFT_SIZE_LIMIT};
+pub use editor::{EditorLauncher, LineArgStyle, resolve_real_path};
 pub use error::{Error, Result};
 pub use folder::{FolderDiff, FolderDiffOptions, FolderEntry, FolderEntryStatus};
 pub use highlight::{

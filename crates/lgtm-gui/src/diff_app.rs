@@ -1,18 +1,35 @@
 //! Two-file diff window.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
 use lgtm_core::{
-    AlignedDiff, DiffDocument, DiffRow, Highlighter, HunkKind, InlineChangeKind, Side, StyledSpan,
-    SyntectHighlighter,
+    AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, Highlighter,
+    HunkKind, InlineChangeKind, Side, StyledSpan, SyntectHighlighter, resolve_real_path,
 };
 
 use crate::theme;
 
 /// Recompute the diff after this much idle time once an edit has landed.
 const DIFF_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// What the user is currently hovering, for status-bar display and for
+/// `e` to know which file + line to open in the editor.
+#[derive(Debug, Clone)]
+pub struct HoverFocus {
+    /// Which side of the diff the cursor is over.
+    pub side: Side,
+    /// 1-based line number on that side, or `None` if the line has no
+    /// concept of a stable line number (replace/gap rows).
+    pub line: Option<usize>,
+    /// Blame info if we have it, `None` otherwise.
+    pub blame: Option<BlameInfo>,
+    /// `true` when the row is on a modified/replaced line and blame is
+    /// intentionally suppressed.
+    pub blame_modified: bool,
+}
 
 /// The egui app driving the two-file diff window.
 pub struct DiffApp {
@@ -47,6 +64,24 @@ pub struct DiffApp {
     cached_left_syntax: Vec<Vec<StyledSpan>>,
     /// Per-line styled spans for the right pane, keyed by 0-based line index.
     cached_right_syntax: Vec<Vec<StyledSpan>>,
+    /// Repository root to use for blame lookups. Set by `--repo`, or
+    /// discovered automatically per-side if `None`.
+    pub repo_root: Option<PathBuf>,
+    /// Editor used for `e` / `Shift+E`. Resolved at startup; failures
+    /// surface as a status-bar message rather than a crash.
+    pub editor: Option<EditorLauncher>,
+    /// In difftool mode, the path passed via `$LOCAL` is a temp file —
+    /// `real_left` / `real_right` are the working-tree paths to open in
+    /// the editor instead (resolved from `--repo` + basename match).
+    pub real_left: Option<PathBuf>,
+    /// See [`real_left`](Self::real_left).
+    pub real_right: Option<PathBuf>,
+    /// Blame cache for both panes. Loaded lazily on hover.
+    blame_cache: BlameCache,
+    /// What the cursor is currently over. Drives status bar + `e` key.
+    hover_focus: Option<HoverFocus>,
+    /// Transient editor-launch error to render in the status bar.
+    editor_status: Option<String>,
 }
 
 impl DiffApp {
@@ -94,7 +129,92 @@ impl DiffApp {
             highlighter,
             cached_left_syntax,
             cached_right_syntax,
+            repo_root: None,
+            editor: None,
+            real_left: None,
+            real_right: None,
+            blame_cache: BlameCache::new(),
+            hover_focus: None,
+            editor_status: None,
         }
+    }
+
+    /// Builder: set the repository root used for blame lookups. When
+    /// `repo_root` is set, paths that match a basename inside the working
+    /// tree are also resolved back to that working tree for `e` (so
+    /// difftool's temp files open as the real working-tree file).
+    pub fn with_repo(mut self, repo: PathBuf) -> Self {
+        self.real_left = resolve_real_path(&repo, &self.left.path);
+        self.real_right = resolve_real_path(&repo, &self.right.path);
+        self.repo_root = Some(repo);
+        self
+    }
+
+    /// Builder: set the editor used for `e` / `Shift+E`.
+    pub fn with_editor(mut self, editor: EditorLauncher) -> Self {
+        self.editor = Some(editor);
+        self
+    }
+
+    /// Launch the configured editor on the currently-focused pane.
+    /// If `both` is true, launch once for each pane.
+    ///
+    /// In difftool mode, `real_left` / `real_right` are preferred over
+    /// `left.path` / `right.path` so the user lands on the working-tree
+    /// file rather than the temp snapshot. The line passed is the
+    /// hovered line on that side when known.
+    pub fn launch_editor(&mut self, both: bool) {
+        let Some(editor) = self.editor.clone() else {
+            self.editor_status = Some("No editor configured (set $EDITOR or --editor)".into());
+            return;
+        };
+        let focus = self.hover_focus.clone();
+        let line_on = |side: Side| -> Option<usize> {
+            focus
+                .as_ref()
+                .filter(|f| f.side == side)
+                .and_then(|f| f.line)
+        };
+        let pick = |side: Side| -> (PathBuf, bool) {
+            match side {
+                Side::Left => match (&self.real_left, &self.left.path) {
+                    (Some(p), _) => (p.clone(), false),
+                    (None, p) => (p.clone(), self.repo_root.is_some()),
+                },
+                Side::Right => match (&self.real_right, &self.right.path) {
+                    (Some(p), _) => (p.clone(), false),
+                    (None, p) => (p.clone(), self.repo_root.is_some()),
+                },
+            }
+        };
+        let mut targets: Vec<(Side, PathBuf, bool)> = Vec::new();
+        if both {
+            let (lp, lt) = pick(Side::Left);
+            let (rp, rt) = pick(Side::Right);
+            targets.push((Side::Left, lp, lt));
+            targets.push((Side::Right, rp, rt));
+        } else {
+            let side = focus.as_ref().map(|f| f.side).unwrap_or(Side::Left);
+            let (p, t) = pick(side);
+            targets.push((side, p, t));
+        }
+        let mut notes: Vec<String> = Vec::new();
+        for (side, path, was_temp) in targets {
+            if was_temp {
+                notes.push(format!(
+                    "Opening temp file {} (no working-tree path resolved)",
+                    path.display()
+                ));
+            }
+            if let Err(e) = editor.open(&path, line_on(side)) {
+                notes.push(format!("Could not launch editor: {e}"));
+            }
+        }
+        self.editor_status = if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join("; "))
+        };
     }
 
     /// Refresh the cached syntax spans for both panes from current content.
@@ -213,7 +333,50 @@ impl DiffApp {
                 ui.separator();
                 ui.label(RichText::new("read-only").color(theme::GUTTER_FG));
             }
+            if let Some(err) = &self.editor_status {
+                ui.separator();
+                ui.label(RichText::new(err).color(Color32::from_rgb(0xff, 0x80, 0x80)));
+            }
         });
+        // Second line: hovered-blame summary (fallback when tooltip is awkward).
+        if let Some(focus) = &self.hover_focus {
+            ui.horizontal(|ui| {
+                let side_label = match focus.side {
+                    Side::Left => "L",
+                    Side::Right => "R",
+                };
+                let line_label = focus
+                    .line
+                    .map(|n| format!("L{n}"))
+                    .unwrap_or_else(|| "-".into());
+                ui.label(
+                    RichText::new(format!("{side_label}:{line_label}"))
+                        .color(theme::GUTTER_FG)
+                        .monospace(),
+                );
+                ui.separator();
+                if focus.blame_modified {
+                    ui.label(
+                        RichText::new("modified line — blame unavailable").color(theme::GUTTER_FG),
+                    );
+                } else if let Some(info) = &focus.blame {
+                    let now = chrono::Local::now().fixed_offset();
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {}  {}  — {}  ({})",
+                            info.short_sha(),
+                            info.author_name,
+                            info.date_string(),
+                            info.short_summary(60),
+                            info.relative_to(now),
+                        ))
+                        .monospace(),
+                    );
+                } else {
+                    ui.label(RichText::new("no blame").color(theme::GUTTER_FG));
+                }
+            });
+        }
     }
 
     fn render_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -305,15 +468,38 @@ impl DiffApp {
             // Place the target row a third of the way down the viewport.
             scroll = scroll.vertical_scroll_offset((row as f32 * row_height) - 60.0);
         }
+
+        // Disjoint borrows so the show_rows closure can mutate blame_cache
+        // while reading the diff + syntax caches + paths.
         let diff = &self.diff;
         let left_syntax = &self.cached_left_syntax;
         let right_syntax = &self.cached_right_syntax;
+        let blame_cache = &mut self.blame_cache;
+        let left_path = self.left.path.clone();
+        let right_path = self.right.path.clone();
+        let repo_root = self.repo_root.clone();
+        let mut hover_focus: Option<HoverFocus> = None;
+
         scroll.show_rows(ui, row_height, total, |ui, row_range| {
             ui.style_mut().override_font_id = Some(FontId::monospace(13.0));
             for idx in row_range {
-                render_row(ui, &diff.rows[idx], row_height, left_syntax, right_syntax);
+                let row = &diff.rows[idx];
+                render_row_with_blame(
+                    ui,
+                    row,
+                    row_height,
+                    left_syntax,
+                    right_syntax,
+                    blame_cache,
+                    repo_root.as_deref(),
+                    &left_path,
+                    &right_path,
+                    &mut hover_focus,
+                );
             }
         });
+
+        self.hover_focus = hover_focus;
     }
 
     fn render_minimap(&mut self, ui: &mut egui::Ui) {
@@ -370,6 +556,7 @@ impl eframe::App for DiffApp {
         let mut first = false;
         let mut last = false;
         let mut want_save = false;
+        let mut want_open: Option<bool> = None; // Some(true) = both panes
         ctx.input(|i| {
             if i.modifiers.command_only() && i.key_pressed(Key::S) {
                 want_save = true;
@@ -393,8 +580,14 @@ impl eframe::App for DiffApp {
                 if i.modifiers.ctrl && i.key_pressed(Key::End) {
                     last = true;
                 }
+                if i.key_pressed(Key::E) {
+                    want_open = Some(i.modifiers.shift);
+                }
             }
         });
+        if let Some(both) = want_open {
+            self.launch_editor(both);
+        }
         if want_save {
             if let Err(e) = self.save() {
                 tracing::error!("save failed: {e}");
@@ -508,12 +701,18 @@ fn render_binary_stub(ui: &mut egui::Ui, left: &DiffDocument, right: &DiffDocume
     });
 }
 
-fn render_row(
+#[allow(clippy::too_many_arguments)]
+fn render_row_with_blame(
     ui: &mut egui::Ui,
     row: &DiffRow,
     row_height: f32,
     left_syntax: &[Vec<StyledSpan>],
     right_syntax: &[Vec<StyledSpan>],
+    blame_cache: &mut BlameCache,
+    repo_root: Option<&std::path::Path>,
+    left_path: &std::path::Path,
+    right_path: &std::path::Path,
+    hover_focus: &mut Option<HoverFocus>,
 ) {
     let bg = row_background(row);
     let avail = ui.available_width();
@@ -540,7 +739,7 @@ fn render_row(
         .and_then(|n| right_syntax.get(n.saturating_sub(1)).map(|v| v.as_slice()))
         .unwrap_or(&[]);
 
-    render_pane(
+    let left_resp = render_pane(
         &mut child,
         half,
         parts.left_num,
@@ -550,7 +749,7 @@ fn render_row(
         left_spans,
     );
     child.add(egui::Separator::default().vertical().spacing(8.0));
-    render_pane(
+    let right_resp = render_pane(
         &mut child,
         half,
         parts.right_num,
@@ -559,6 +758,53 @@ fn render_row(
         &parts.inline_right,
         right_spans,
     );
+
+    // Blame on hover. Replace rows are "modified (no blame)" by design —
+    // line N in the view doesn't correspond to line N in the committed
+    // file once both sides have changed.
+    let is_replace = matches!(row, DiffRow::Replace { .. });
+    let mut blame_resp =
+        |resp: egui::Response, side: Side, line: Option<usize>, file: &std::path::Path| {
+            if !resp.hovered() {
+                return;
+            }
+            if is_replace || line.is_none() {
+                *hover_focus = Some(HoverFocus {
+                    side,
+                    line,
+                    blame: None,
+                    blame_modified: true,
+                });
+                resp.on_hover_text("modified line — blame unavailable");
+                return;
+            }
+            let line = line.unwrap();
+            let root = repo_root.unwrap_or(file);
+            // Lazy load. Silent failure: if blame isn't available, we just
+            // don't show a tooltip.
+            let _ = blame_cache.load(root, file);
+            let info = blame_cache.get(root, file, line).cloned();
+            *hover_focus = Some(HoverFocus {
+                side,
+                line: Some(line),
+                blame: info.clone(),
+                blame_modified: false,
+            });
+            if let Some(info) = info {
+                let now = chrono::Local::now().fixed_offset();
+                let tooltip = format!(
+                    "{}  {}  {}\n{}\n\n{}",
+                    info.short_sha(),
+                    info.author_name,
+                    info.date_string(),
+                    info.short_summary(60),
+                    info.relative_to(now),
+                );
+                resp.on_hover_text(tooltip);
+            }
+        };
+    blame_resp(left_resp, Side::Left, parts.left_num, left_path);
+    blame_resp(right_resp, Side::Right, parts.right_num, right_path);
 }
 
 type InlineSpans = Vec<(std::ops::Range<usize>, InlineChangeKind)>;
@@ -580,8 +826,8 @@ fn render_pane(
     side: Side,
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
     syntax: &[StyledSpan],
-) {
-    ui.scope(|ui| {
+) -> egui::Response {
+    let resp = ui.scope(|ui| {
         ui.set_max_width(width);
         ui.horizontal(|ui| {
             let gutter = match line_num {
@@ -593,6 +839,14 @@ fn render_pane(
             ui.label(layout);
         });
     });
+    // Promote the scope to a hover-sensing rect.
+    let r = resp.response.rect;
+    let side_tag = if matches!(side, Side::Left) { 0u8 } else { 1u8 };
+    ui.interact(
+        r,
+        ui.id().with(("pane", line_num, side_tag)),
+        Sense::hover(),
+    )
 }
 
 /// Build a [`LayoutJob`] for one displayed line that combines syntax

@@ -21,6 +21,13 @@ first-class support for use as `git difftool` and `git mergetool`.
   minimap of all changes.
 - **Syntax highlighting** via `syntect` for any of its bundled
   languages; picked by file extension and re-applied after each edit.
+- **Blame on hover** — when the file is in a git repo, hover any
+  unchanged line to see the commit SHA, author, date, and summary that
+  last touched it. Lazy-loaded on first hover so startup stays fast.
+- **Open in editor** — press `e` to jump to the hovered line in your
+  `$EDITOR` (or whatever you configure); `Shift+E` opens both panes.
+  Knows the line-number syntax for vim/nvim, VS Code, Helix, Sublime,
+  JetBrains, and falls back gracefully for unknown editors.
 - **Live editing** of either pane with a 150 ms debounced re-diff;
   Ctrl+S saves back to disk preserving the original encoding and line
   endings.
@@ -45,11 +52,17 @@ After install, `lgtm --version` should print the banner.
 
 ```bash
 git config --global diff.tool lgtm
-git config --global difftool.lgtm.cmd 'lgtm "$LOCAL" "$REMOTE"'
+git config --global difftool.lgtm.cmd \
+  'lgtm "$LOCAL" "$REMOTE" --repo "$(git rev-parse --show-toplevel)"'
 git config --global difftool.prompt false
 ```
 
 Now `git difftool HEAD~1` opens `lgtm` for each changed file.
+
+The `--repo` argument is what makes **blame on hover** and **open in
+editor** work from a difftool context: `$LOCAL` and `$REMOTE` are temp
+snapshots, but `--repo` tells lgtm where the real working tree lives so
+it can blame against it and open the live working-tree file with `e`.
 
 For directory mode (`git difftool -d`) lgtm detects two directory
 arguments automatically and opens its folder-diff view.
@@ -78,7 +91,17 @@ lgtm --no-gui <LEFT> <RIGHT>                             # print unified diff to
 lgtm --dir  <LEFT> <RIGHT>                               # force folder mode
 lgtm --file <LEFT> <RIGHT>                               # force file mode
 lgtm --quiet ...                                         # suppress "LGTM ✓" on success
+lgtm --repo <PATH> ...                                   # working-tree root for blame + editor
+lgtm --editor <CMD> ...                                  # override $EDITOR for the `e` keybind
 ```
+
+### Environment variables
+
+| Variable      | Purpose                                                                              |
+|---------------|--------------------------------------------------------------------------------------|
+| `LGTM_EDITOR` | Preferred editor for the `e` keybinding. Beats `$VISUAL` and `$EDITOR`.              |
+| `LGTM_LOG`    | `tracing-subscriber` filter (e.g. `LGTM_LOG=debug` for verbose logs).                |
+| `LGTM_HEADLESS_MERGE` | Internal: bypasses the merge GUI for end-to-end tests (`take-local`, etc.).  |
 
 ### Exit codes
 
@@ -93,12 +116,14 @@ saved), it prints `LGTM ✓` to stderr unless `--quiet` is passed.
 
 ## Keyboard shortcuts (diff view)
 
-| Key                 | Action                                |
-|---------------------|---------------------------------------|
-| `n` / `p`           | next / previous hunk                  |
-| `Ctrl+Home` / `End` | first / last hunk                     |
-| `Ctrl+S`            | save modified panes                   |
-| `Esc` / `q`         | close window (confirms if dirty)      |
+| Key                 | Action                                                |
+|---------------------|-------------------------------------------------------|
+| `n` / `p`           | next / previous hunk                                  |
+| `Ctrl+Home` / `End` | first / last hunk                                     |
+| `e`                 | open hovered file at the hovered line in `$EDITOR`    |
+| `Shift+E`           | open both panes' files in the editor                  |
+| `Ctrl+S`            | save modified panes                                   |
+| `Esc` / `q`         | close window (confirms if dirty)                      |
 
 ## Headless merge (test / CI)
 
@@ -165,6 +190,23 @@ just setup-git
   Files larger than 50 MB get a warning; files larger than 500 MB are
   refused outright. If you need to diff something larger, consider
   pre-filtering with `head` / `grep` and diffing the slices.
+
+- **Why isn't blame showing on hover?**
+  Blame loads silently and shows nothing when it can't. Common causes:
+  (1) the file isn't tracked in a git repo, (2) you're using lgtm as a
+  difftool without `--repo` so it's looking at temp files (add
+  `--repo "$(git rev-parse --show-toplevel)"` to your difftool config),
+  (3) you're hovering a Replace/modified line — those are intentionally
+  "blame unavailable" because the line N in the view doesn't correspond
+  to line N in any committed file, (4) the file is over 50,000 lines
+  (`BLAME_LINE_CAP`).
+
+- **`e` opens a `/tmp/...` snapshot instead of my real file.**
+  You're using lgtm as a difftool without `--repo`. With `--repo` set,
+  `e` resolves the temp file back to its working-tree counterpart by
+  basename and opens that. If multiple files in your tree share the
+  basename, lgtm refuses to guess and opens the temp file with a
+  status-bar note.
 
 ## CI
 
