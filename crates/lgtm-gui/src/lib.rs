@@ -14,10 +14,12 @@ use std::path::PathBuf;
 use lgtm_core::{AlignedDiff, DiffDocument, FolderDiff, ThreeWayMerge};
 
 mod diff_app;
+mod folder_app;
 mod merge_app;
 mod theme;
 
 pub use diff_app::DiffApp;
+pub use folder_app::{FolderApp, FolderFilters};
 pub use merge_app::{MergeApp, MergeExit};
 
 /// Outcome of a GUI session, mapped by the CLI to a process exit code.
@@ -108,8 +110,27 @@ impl eframe::App for MergeAppWithExit {
     }
 }
 
-/// Launch the folder-diff window.
+/// Launch the folder-diff window. Returns [`GuiOutcome::Identical`] if the
+/// folder diff contains no non-identical entries, else [`GuiOutcome::Differs`].
 pub fn run_folder(diff: FolderDiff) -> anyhow::Result<GuiOutcome> {
-    let _ = diff;
-    todo!("step 9: folder window")
+    let outcome = if diff
+        .entries
+        .iter()
+        .all(|e| e.status == lgtm_core::FolderEntryStatus::Identical)
+    {
+        GuiOutcome::Identical
+    } else {
+        GuiOutcome::Differs
+    };
+
+    let app = FolderApp::new(diff);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("lgtm — folder diff")
+            .with_inner_size([1200.0, 800.0]),
+        ..Default::default()
+    };
+    eframe::run_native("lgtm", options, Box::new(|_cc| Ok(Box::new(app))))
+        .map_err(|e| anyhow::anyhow!("eframe init failed: {e}"))?;
+    Ok(outcome)
 }

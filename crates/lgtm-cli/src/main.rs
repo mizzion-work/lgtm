@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use lgtm_core::{unified_diff, DiffDocument, ThreeWayMerge};
+use lgtm_core::{DiffDocument, FolderDiff, FolderDiffOptions, ThreeWayMerge, unified_diff};
 use lgtm_gui::GuiOutcome;
 
 const EXIT_IDENTICAL: u8 = 0;
@@ -93,7 +93,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<u8> {
     };
 
     if folder_mode {
-        return dispatch_folder(&cli.left, &right_path);
+        return dispatch_folder(&cli.left, &right_path, cli.no_gui, cli.quiet);
     }
 
     let left = DiffDocument::load(&cli.left)?;
@@ -245,9 +245,52 @@ fn dispatch_merge_headless(
     }
 }
 
-fn dispatch_folder(left: &Path, right: &Path) -> anyhow::Result<u8> {
-    let _ = (left, right);
-    anyhow::bail!("folder mode is not implemented yet (lands in step 9)")
+fn dispatch_folder(left: &Path, right: &Path, no_gui: bool, quiet: bool) -> anyhow::Result<u8> {
+    let opts = FolderDiffOptions::default();
+    let diff = FolderDiff::compute(left, right, &opts)?;
+
+    let any_differ = diff
+        .entries
+        .iter()
+        .any(|e| e.status != lgtm_core::FolderEntryStatus::Identical);
+
+    if no_gui {
+        use lgtm_core::FolderEntryStatus;
+        for e in &diff.entries {
+            let marker = match e.status {
+                FolderEntryStatus::Identical => '=',
+                FolderEntryStatus::Modified => '~',
+                FolderEntryStatus::LeftOnly => '<',
+                FolderEntryStatus::RightOnly => '>',
+                FolderEntryStatus::TypeChanged => '!',
+                FolderEntryStatus::BinaryDiffers => 'b',
+            };
+            if matches!(e.status, FolderEntryStatus::Identical) {
+                continue;
+            }
+            println!("{marker} {}", e.relative_path.display());
+        }
+        return Ok(if any_differ {
+            EXIT_DIFFERS
+        } else {
+            emit_lgtm(quiet);
+            EXIT_IDENTICAL
+        });
+    }
+
+    if !any_differ {
+        emit_lgtm(quiet);
+        return Ok(EXIT_IDENTICAL);
+    }
+
+    let outcome = lgtm_gui::run_folder(diff)?;
+    Ok(match outcome {
+        GuiOutcome::Identical => {
+            emit_lgtm(quiet);
+            EXIT_IDENTICAL
+        }
+        GuiOutcome::Differs => EXIT_DIFFERS,
+    })
 }
 
 fn is_dir(p: &Path) -> bool {

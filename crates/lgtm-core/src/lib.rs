@@ -28,11 +28,11 @@ pub mod highlight;
 pub mod merge;
 
 pub use diff::{
-    unified_diff, AlignedDiff, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange,
-    InlineChangeKind, Side,
+    AlignedDiff, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange, InlineChangeKind, Side,
+    unified_diff,
 };
 pub use document::{DiffDocument, LineEnding};
 pub use error::{Error, Result};
-pub use folder::{FolderDiff, FolderEntry, FolderEntryStatus};
+pub use folder::{FolderDiff, FolderDiffOptions, FolderEntry, FolderEntryStatus};
 pub use highlight::{Highlighter, NoopHighlighter};
 pub use merge::{MergeRegion, ThreeWayMerge};

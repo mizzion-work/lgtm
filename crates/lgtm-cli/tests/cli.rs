@@ -179,6 +179,60 @@ fn merge_headless_take_local_resolves_conflict() {
     assert_eq!(body, "a\nLOCAL\nc\n");
 }
 
+fn tmp_dir(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let d = std::env::temp_dir().join(format!("lgtm-cli-dir-{name}-{nanos}"));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn folder_no_gui_identical_trees_exit_zero() {
+    let l = tmp_dir("folder-id-l");
+    let r = tmp_dir("folder-id-r");
+    std::fs::write(l.join("a.txt"), b"x").unwrap();
+    std::fs::write(r.join("a.txt"), b"x").unwrap();
+    let out = Command::new(bin())
+        .args(["--no-gui", "--dir"])
+        .arg(&l)
+        .arg(&r)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn folder_no_gui_modified_tree_exits_one_and_lists_diffs() {
+    let l = tmp_dir("folder-mod-l");
+    let r = tmp_dir("folder-mod-r");
+    std::fs::write(l.join("same.txt"), b"x").unwrap();
+    std::fs::write(r.join("same.txt"), b"x").unwrap();
+    std::fs::write(l.join("only_left.txt"), b"L").unwrap();
+    // Different sizes so the cheap-identity shortcut doesn't kick in.
+    std::fs::write(l.join("changed.txt"), b"OLD\n").unwrap();
+    std::fs::write(r.join("changed.txt"), b"NEW CONTENT\n").unwrap();
+
+    let out = Command::new(bin())
+        .args(["--no-gui", "--dir"])
+        .arg(&l)
+        .arg(&r)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("changed.txt"));
+    assert!(stdout.contains("only_left.txt"));
+    assert!(!stdout.contains("same.txt"));
+}
+
 #[test]
 fn merge_headless_abort_exits_one_and_doesnt_write_output() {
     let local = tmp("a_local.txt", b"a\nLOCAL\nc\n");
