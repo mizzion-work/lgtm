@@ -445,46 +445,72 @@ impl DiffApp {
     fn render_edit_panes(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
         let half = (avail.x - 8.0) * 0.5;
+        let read_only = self.read_only;
         ui.horizontal_top(|ui| {
-            let left_resp = ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
+            // Disjoint borrows: each pane gets its content + its cached
+            // syntax spans. The layouter borrows the spans immutably;
+            // the TextEdit borrows the content mutably.
+            let left_content = &mut self.left.content;
+            let left_syntax = &self.cached_left_syntax;
+            let mut left_layouter =
+                move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
+                    let job = build_edit_layout(text, left_syntax);
+                    ui.fonts(|f| f.layout_job(job))
+                };
+            let mut left_edited = false;
+            ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
                 ScrollArea::vertical()
                     .id_salt("lgtm-edit-left")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let resp = ui.add(
-                            egui::TextEdit::multiline(&mut self.left.content)
+                            egui::TextEdit::multiline(left_content)
                                 .font(FontId::monospace(13.0))
                                 .code_editor()
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(40)
-                                .interactive(!self.read_only),
+                                .interactive(!read_only)
+                                .layouter(&mut left_layouter),
                         );
                         if resp.changed() {
-                            self.mark_edited(Side::Left);
+                            left_edited = true;
                         }
                     });
             });
-            let _ = left_resp;
             ui.separator();
-            let right_resp = ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
+            let right_content = &mut self.right.content;
+            let right_syntax = &self.cached_right_syntax;
+            let mut right_layouter =
+                move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
+                    let job = build_edit_layout(text, right_syntax);
+                    ui.fonts(|f| f.layout_job(job))
+                };
+            let mut right_edited = false;
+            ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
                 ScrollArea::vertical()
                     .id_salt("lgtm-edit-right")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let resp = ui.add(
-                            egui::TextEdit::multiline(&mut self.right.content)
+                            egui::TextEdit::multiline(right_content)
                                 .font(FontId::monospace(13.0))
                                 .code_editor()
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(40)
-                                .interactive(!self.read_only),
+                                .interactive(!read_only)
+                                .layouter(&mut right_layouter),
                         );
                         if resp.changed() {
-                            self.mark_edited(Side::Right);
+                            right_edited = true;
                         }
                     });
             });
-            let _ = right_resp;
+            if left_edited {
+                self.mark_edited(Side::Left);
+            }
+            if right_edited {
+                self.mark_edited(Side::Right);
+            }
         });
     }
 
@@ -961,6 +987,78 @@ fn render_center_column(
     if left_btn.clicked() {
         *pending_copy = Some((idx, CopyDirection::RightToLeft));
     }
+}
+
+/// Build a [`LayoutJob`] for the **whole document** shown in edit mode's
+/// `TextEdit`. Applies the per-line `syntax` spans we already keep in
+/// `DiffApp::cached_*_syntax`; falls back to plain text for any line
+/// whose cached spans no longer fit (the user just typed there and the
+/// debounced re-highlight hasn't fired yet) or for which we have no
+/// cache entry at all (a line that was just added).
+fn build_edit_layout(text: &str, syntax: &[Vec<StyledSpan>]) -> egui::text::LayoutJob {
+    let font = FontId::monospace(13.0);
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        // PLACEHOLDER tells egui "use the surrounding text color" — i.e.
+        // honor the user's light/dark theme rather than baking in gray.
+        color: Color32::PLACEHOLDER,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    for (line_idx, line_with_nl) in text.split_inclusive('\n').enumerate() {
+        let has_nl = line_with_nl.ends_with('\n');
+        let line = if has_nl {
+            &line_with_nl[..line_with_nl.len() - 1]
+        } else {
+            line_with_nl
+        };
+        let spans = syntax.get(line_idx).map(Vec::as_slice).unwrap_or(&[]);
+        let line_len = line.len();
+        let max_end = spans.iter().map(|s| s.range.end).max().unwrap_or(0);
+        let stale_or_empty = spans.is_empty() || max_end > line_len;
+        if stale_or_empty {
+            job.append(line, 0.0, plain.clone());
+            if has_nl {
+                job.append("\n", 0.0, plain.clone());
+            }
+            continue;
+        }
+        let mut cursor = 0usize;
+        for span in spans {
+            let start = span.range.start.min(line_len);
+            let end = span.range.end.min(line_len);
+            if !line.is_char_boundary(start) || !line.is_char_boundary(end) {
+                continue;
+            }
+            if start > cursor {
+                job.append(&line[cursor..start], 0.0, plain.clone());
+            }
+            let r = ((span.rgb >> 16) & 0xff) as u8;
+            let g = ((span.rgb >> 8) & 0xff) as u8;
+            let b = (span.rgb & 0xff) as u8;
+            let color = if r == 0 && g == 0 && b == 0 {
+                Color32::PLACEHOLDER
+            } else {
+                Color32::from_rgb(r, g, b)
+            };
+            let fmt = egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            };
+            if end > start {
+                job.append(&line[start..end], 0.0, fmt);
+            }
+            cursor = end;
+        }
+        if cursor < line_len {
+            job.append(&line[cursor..], 0.0, plain.clone());
+        }
+        if has_nl {
+            job.append("\n", 0.0, plain.clone());
+        }
+    }
+    job
 }
 
 /// Build a [`LayoutJob`] for one displayed line that combines syntax
@@ -1461,5 +1559,135 @@ mod tests {
         let mut app = fixture("a\n", "a\nX\n");
         app.copy_hunk(0, CopyDirection::RightToLeft);
         assert_eq!(app.left.content, "a\nX\n");
+    }
+
+    // ---- edit-mode syntax layouter ---------------------------------
+
+    #[test]
+    fn build_edit_layout_empty_text_yields_empty_job() {
+        let job = build_edit_layout("", &[]);
+        assert!(job.sections.is_empty());
+    }
+
+    #[test]
+    fn build_edit_layout_plain_text_with_no_spans_renders_each_line() {
+        let job = build_edit_layout("a\nb\nc\n", &[]);
+        let text: String = job
+            .sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(text, "a\nb\nc\n");
+        // Every section should be plain (no color override).
+        for s in &job.sections {
+            assert_eq!(s.format.color, Color32::PLACEHOLDER);
+        }
+    }
+
+    #[test]
+    fn build_edit_layout_applies_spans_per_line() {
+        // Two lines, two spans on line 1, one span on line 2.
+        let syntax = vec![
+            vec![
+                StyledSpan {
+                    range: 0..2,
+                    rgb: 0xff_00_00,
+                    style_bits: 0,
+                },
+                StyledSpan {
+                    range: 2..5,
+                    rgb: 0x00_ff_00,
+                    style_bits: 0,
+                },
+            ],
+            vec![StyledSpan {
+                range: 0..3,
+                rgb: 0x00_00_ff,
+                style_bits: 0,
+            }],
+        ];
+        let job = build_edit_layout("ab cd\nfoo\n", &syntax);
+        // Expect: red "ab", green " cd", newline, blue "foo", newline.
+        let texts: Vec<&str> = job
+            .sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(texts, vec!["ab", " cd", "\n", "foo", "\n"]);
+        assert_eq!(job.sections[0].format.color, Color32::from_rgb(0xff, 0, 0));
+        assert_eq!(job.sections[1].format.color, Color32::from_rgb(0, 0xff, 0));
+        assert_eq!(job.sections[3].format.color, Color32::from_rgb(0, 0, 0xff));
+    }
+
+    #[test]
+    fn build_edit_layout_falls_back_to_plain_when_spans_are_stale() {
+        // The cache says line 1 has 10 bytes of spans, but the user has
+        // since deleted half the line so it's only 3 bytes long. The
+        // layouter must render the line plain rather than slicing past
+        // the end (which would panic).
+        let syntax = vec![vec![StyledSpan {
+            range: 0..10,
+            rgb: 0xff_00_00,
+            style_bits: 0,
+        }]];
+        let job = build_edit_layout("abc\n", &syntax);
+        let texts: Vec<&str> = job
+            .sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(texts, vec!["abc", "\n"]);
+        // Plain, since spans were stale.
+        assert_eq!(job.sections[0].format.color, Color32::PLACEHOLDER);
+    }
+
+    #[test]
+    fn build_edit_layout_handles_lines_added_since_last_highlight() {
+        // Cache covers one line, the buffer now has three.
+        let syntax = vec![vec![StyledSpan {
+            range: 0..1,
+            rgb: 0xff_00_00,
+            style_bits: 0,
+        }]];
+        let job = build_edit_layout("a\nb\nc\n", &syntax);
+        // Line 1 is colored; lines 2 and 3 are plain.
+        let texts: Vec<&str> = job
+            .sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(texts, vec!["a", "\n", "b", "\n", "c", "\n"]);
+        assert_eq!(job.sections[0].format.color, Color32::from_rgb(0xff, 0, 0));
+        assert_eq!(job.sections[2].format.color, Color32::PLACEHOLDER);
+        assert_eq!(job.sections[4].format.color, Color32::PLACEHOLDER);
+    }
+
+    #[test]
+    fn build_edit_layout_handles_final_line_without_newline() {
+        let syntax = vec![vec![StyledSpan {
+            range: 0..3,
+            rgb: 0xff_00_00,
+            style_bits: 0,
+        }]];
+        let job = build_edit_layout("abc", &syntax);
+        let texts: Vec<&str> = job
+            .sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(texts, vec!["abc"]);
+    }
+
+    #[test]
+    fn build_edit_layout_skips_spans_that_split_utf8_codepoints() {
+        // "é" is 2 bytes; a span ending at byte 1 would split it. The
+        // layouter must skip such a span rather than panic.
+        let syntax = vec![vec![StyledSpan {
+            range: 0..1,
+            rgb: 0xff_00_00,
+            style_bits: 0,
+        }]];
+        // Should not panic.
+        let _ = build_edit_layout("élan\n", &syntax);
     }
 }
