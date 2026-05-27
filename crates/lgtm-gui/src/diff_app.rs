@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense};
 use lgtm_core::{
-    AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, FindState,
+    AlignedDiff, AppTheme, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, FindState,
     Highlighter, HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Settings, Side,
     StyledSpan, SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
 };
@@ -128,21 +128,22 @@ enum OpenRequest {
 
 impl DiffApp {
     /// Construct an app from already-loaded documents and a precomputed diff.
-    /// Uses the default [`SyntectHighlighter`] (dark theme); call
-    /// [`DiffApp::with_highlighter`] to override (mostly useful for tests).
+    /// Uses a [`SyntectHighlighter`] built from the persisted
+    /// `editor_theme` setting; call [`DiffApp::with_highlighter`] to
+    /// override (mostly useful for tests).
     pub fn new(
         left: DiffDocument,
         right: DiffDocument,
         diff: AlignedDiff,
         read_only: bool,
     ) -> Self {
-        Self::with_highlighter(
-            left,
-            right,
-            diff,
-            read_only,
-            Arc::new(SyntectHighlighter::dark()),
-        )
+        let settings = Settings::load();
+        let highlighter: Arc<dyn Highlighter> = Arc::new(SyntectHighlighter::with_theme(
+            settings.editor_theme.syntect_name(),
+        ));
+        let mut app = Self::with_highlighter(left, right, diff, read_only, highlighter);
+        app.settings = settings;
+        app
     }
 
     /// Construct an app with a custom [`Highlighter`].
@@ -281,7 +282,25 @@ impl DiffApp {
                 self.settings.reset_font();
                 let _ = self.settings.save();
             }
+            MenuAction::SetAppTheme(t) => {
+                self.settings.app_theme = t;
+                let _ = self.settings.save();
+            }
+            MenuAction::SetEditorTheme(t) => {
+                self.settings.editor_theme = t;
+                let _ = self.settings.save();
+                self.apply_editor_theme();
+            }
         }
+    }
+
+    /// Rebuild the highlighter from the current editor-theme setting and
+    /// re-run it across both panes' content.
+    pub fn apply_editor_theme(&mut self) {
+        self.highlighter = Arc::new(SyntectHighlighter::with_theme(
+            self.settings.editor_theme.syntect_name(),
+        ));
+        self.refresh_highlights();
     }
 
     fn open_recent(&mut self, entry: RecentEntry) {
@@ -1004,6 +1023,10 @@ impl eframe::App for DiffApp {
             }
         }
 
+        // App theme picked at the top of every frame so reloads from
+        // disk and runtime toggles apply consistently.
+        apply_app_theme(ctx, self.settings.app_theme);
+
         // Menubar (File / Edit / View / Help) sits above the title.
         let mut actions: Vec<MenuAction> = Vec::new();
         egui::TopBottomPanel::top("lgtm-menubar").show(ctx, |ui| {
@@ -1014,6 +1037,8 @@ impl eframe::App for DiffApp {
                 supports_hunk_nav: true,
                 supports_editor: self.editor.is_some(),
                 read_only: self.read_only,
+                app_theme: self.settings.app_theme,
+                editor_theme: self.settings.editor_theme,
             };
             crate::menubar::render_menubar(ui, mctx, &self.recents, &mut actions);
         });
@@ -1714,6 +1739,17 @@ fn strip_nl(s: &str) -> &str {
     s.strip_suffix('\n').unwrap_or(s)
 }
 
+/// Apply the user's chosen [`AppTheme`] to egui's `Context`. `Auto`
+/// lets egui keep its current `Visuals`; explicit choices force the
+/// matching `Visuals::light()` / `Visuals::dark()`.
+pub fn apply_app_theme(ctx: &egui::Context, theme: AppTheme) {
+    match theme {
+        AppTheme::Auto => { /* leave egui alone */ }
+        AppTheme::Light => ctx.set_visuals(egui::Visuals::light()),
+        AppTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+    }
+}
+
 /// Pick a language hint (file extension, lowercased, no dot) for a document.
 /// Empty string means "let the highlighter fall back to plain text".
 fn hint_for(doc: &DiffDocument) -> String {
@@ -2300,6 +2336,31 @@ mod tests {
         assert_eq!(find_bg_at(&ranges, 3), Some(theme::FIND_CURRENT_BG));
         assert_eq!(find_bg_at(&ranges, 1), Some(theme::FIND_BG));
         assert_eq!(find_bg_at(&ranges, 10), None);
+    }
+
+    #[test]
+    fn handle_menu_action_set_app_theme_updates_settings() {
+        let mut app = fixture("a\n", "b\n");
+        assert_eq!(app.settings.app_theme, lgtm_core::AppTheme::Auto);
+        app.handle_menu_action(MenuAction::SetAppTheme(lgtm_core::AppTheme::Dark));
+        assert_eq!(app.settings.app_theme, lgtm_core::AppTheme::Dark);
+        app.handle_menu_action(MenuAction::SetAppTheme(lgtm_core::AppTheme::Light));
+        assert_eq!(app.settings.app_theme, lgtm_core::AppTheme::Light);
+    }
+
+    #[test]
+    fn handle_menu_action_set_editor_theme_updates_and_reapplies() {
+        let mut app = fixture("fn x() {}\n", "fn x() {}\n");
+        app.handle_menu_action(MenuAction::SetEditorTheme(
+            lgtm_core::EditorTheme::SolarizedLight,
+        ));
+        assert_eq!(
+            app.settings.editor_theme,
+            lgtm_core::EditorTheme::SolarizedLight
+        );
+        // apply_editor_theme refreshes the cached spans → at minimum
+        // there's one entry per line in the new cache.
+        assert_eq!(app.cached_left_syntax.len(), 1);
     }
 
     #[test]

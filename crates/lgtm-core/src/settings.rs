@@ -20,6 +20,108 @@ pub const MAX_FONT_SIZE: f32 = 32.0;
 /// Increment / decrement step.
 pub const FONT_SIZE_STEP: f32 = 1.0;
 
+/// Which palette the GUI shell uses (egui's window chrome, menus, etc).
+/// `Auto` follows the OS preference where supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTheme {
+    /// Follow the OS / egui default.
+    Auto,
+    /// Force light mode.
+    Light,
+    /// Force dark mode.
+    Dark,
+}
+
+impl AppTheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            AppTheme::Auto => "auto",
+            AppTheme::Light => "light",
+            AppTheme::Dark => "dark",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(AppTheme::Auto),
+            "light" => Some(AppTheme::Light),
+            "dark" => Some(AppTheme::Dark),
+            _ => None,
+        }
+    }
+}
+
+/// Which syntect theme paints the source code in the diff view. A few
+/// bundled themes are surfaced explicitly; anything else falls through
+/// to the syntect default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTheme {
+    /// `base16-eighties.dark` — dark, vibrant. Default.
+    EightiesDark,
+    /// `base16-mocha.dark` — dark, warm.
+    MochaDark,
+    /// `base16-ocean.dark` — dark, blue.
+    OceanDark,
+    /// `base16-ocean.light` — light, blue.
+    OceanLight,
+    /// `InspiredGitHub` — light, GitHub-style.
+    InspiredGitHub,
+    /// `Solarized (dark)`.
+    SolarizedDark,
+    /// `Solarized (light)`.
+    SolarizedLight,
+}
+
+impl EditorTheme {
+    /// Name as accepted by [`crate::SyntectHighlighter::with_theme`].
+    pub fn syntect_name(self) -> &'static str {
+        match self {
+            EditorTheme::EightiesDark => "base16-eighties.dark",
+            EditorTheme::MochaDark => "base16-mocha.dark",
+            EditorTheme::OceanDark => "base16-ocean.dark",
+            EditorTheme::OceanLight => "base16-ocean.light",
+            EditorTheme::InspiredGitHub => "InspiredGitHub",
+            EditorTheme::SolarizedDark => "Solarized (dark)",
+            EditorTheme::SolarizedLight => "Solarized (light)",
+        }
+    }
+
+    /// All bundled choices, in menu order.
+    pub fn all() -> &'static [EditorTheme] {
+        &[
+            EditorTheme::EightiesDark,
+            EditorTheme::MochaDark,
+            EditorTheme::OceanDark,
+            EditorTheme::OceanLight,
+            EditorTheme::InspiredGitHub,
+            EditorTheme::SolarizedDark,
+            EditorTheme::SolarizedLight,
+        ]
+    }
+
+    /// Short, human-friendly label for the menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            EditorTheme::EightiesDark => "Base16 Eighties (dark)",
+            EditorTheme::MochaDark => "Base16 Mocha (dark)",
+            EditorTheme::OceanDark => "Base16 Ocean (dark)",
+            EditorTheme::OceanLight => "Base16 Ocean (light)",
+            EditorTheme::InspiredGitHub => "InspiredGitHub (light)",
+            EditorTheme::SolarizedDark => "Solarized (dark)",
+            EditorTheme::SolarizedLight => "Solarized (light)",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|t| t.syntect_name() == s)
+    }
+}
+
+impl Default for EditorTheme {
+    fn default() -> Self {
+        EditorTheme::EightiesDark
+    }
+}
+
 /// User preferences. New fields are additive: add the field, give it a
 /// sensible default in [`Settings::default`], add a row in
 /// [`Settings::save_to`] / [`Settings::load_from`], and consumers will
@@ -28,12 +130,18 @@ pub const FONT_SIZE_STEP: f32 = 1.0;
 pub struct Settings {
     /// Monospace font size for both diff and edit views.
     pub font_size: f32,
+    /// egui chrome theme (window background, menus, buttons).
+    pub app_theme: AppTheme,
+    /// Syntect theme for syntax-highlighted code in the diff view.
+    pub editor_theme: EditorTheme,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: DEFAULT_FONT_SIZE,
+            app_theme: AppTheme::Auto,
+            editor_theme: EditorTheme::default(),
         }
     }
 }
@@ -65,6 +173,16 @@ impl Settings {
                         out.font_size = clamp_font(v);
                     }
                 }
+                "app_theme" => {
+                    if let Some(t) = AppTheme::parse(val) {
+                        out.app_theme = t;
+                    }
+                }
+                "editor_theme" => {
+                    if let Some(t) = EditorTheme::parse(val) {
+                        out.editor_theme = t;
+                    }
+                }
                 _ => { /* unknown key — ignore for forward-compat */ }
             }
         }
@@ -88,7 +206,12 @@ impl Settings {
                 source,
             })?;
         }
-        let body = format!("font_size\t{}\n", self.font_size);
+        let body = format!(
+            "font_size\t{}\napp_theme\t{}\neditor_theme\t{}\n",
+            self.font_size,
+            self.app_theme.as_str(),
+            self.editor_theme.syntect_name(),
+        );
         std::fs::write(path, body).map_err(|source| crate::error::Error::Io {
             path: path.to_path_buf(),
             source,
@@ -169,10 +292,46 @@ mod tests {
     #[test]
     fn save_then_load_round_trips() {
         let path = tmp_path("rt");
-        let s = Settings { font_size: 17.0 };
+        let s = Settings {
+            font_size: 17.0,
+            app_theme: AppTheme::Light,
+            editor_theme: EditorTheme::SolarizedLight,
+        };
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.font_size, 17.0);
+        assert_eq!(loaded.app_theme, AppTheme::Light);
+        assert_eq!(loaded.editor_theme, EditorTheme::SolarizedLight);
+    }
+
+    #[test]
+    fn app_theme_parse_round_trips() {
+        for t in [AppTheme::Auto, AppTheme::Light, AppTheme::Dark] {
+            assert_eq!(AppTheme::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(AppTheme::parse("bogus"), None);
+    }
+
+    #[test]
+    fn editor_theme_parse_finds_each_bundled_one() {
+        for t in EditorTheme::all() {
+            assert_eq!(EditorTheme::parse(t.syntect_name()), Some(*t));
+        }
+        assert_eq!(EditorTheme::parse("not-a-theme"), None);
+    }
+
+    #[test]
+    fn unknown_theme_value_falls_back_to_default() {
+        let path = tmp_path("unknown-theme");
+        std::fs::write(
+            &path,
+            "app_theme\tplaid\neditor_theme\trainbow\nfont_size\t14.0\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.font_size, 14.0);
+        assert_eq!(s.app_theme, AppTheme::Auto);
+        assert_eq!(s.editor_theme, EditorTheme::default());
     }
 
     #[test]

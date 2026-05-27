@@ -50,4 +50,7 @@ pub use highlight::{
 };
 pub use merge::{MergeRegion, ThreeWayMerge};
 pub use recent::{MAX_RECENT, RecentEntry, RecentList, RecentMode};
-pub use settings::{DEFAULT_FONT_SIZE, FONT_SIZE_STEP, MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
+pub use settings::{
+    AppTheme, DEFAULT_FONT_SIZE, EditorTheme, FONT_SIZE_STEP, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    Settings,
+};

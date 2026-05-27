@@ -6,7 +6,7 @@
 //! returned action so the menubar stays testable and re-renderable.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
-use lgtm_core::{RecentEntry, RecentList, RecentMode};
+use lgtm_core::{AppTheme, EditorTheme, RecentEntry, RecentList, RecentMode};
 
 /// User intent emitted by [`render_menubar`].
 ///
@@ -51,6 +51,10 @@ pub enum MenuAction {
     DecreaseFontSize,
     /// Reset font size to the default.
     ResetFontSize,
+    /// Switch the egui chrome theme (window background, menus, buttons).
+    SetAppTheme(AppTheme),
+    /// Switch the syntect theme used to color source code.
+    SetEditorTheme(EditorTheme),
 }
 
 /// What state the host window can do at the moment. Drives whether items
@@ -69,6 +73,10 @@ pub struct MenuContext {
     pub supports_editor: bool,
     /// `true` if `--read-only` was passed; toggle/save are hidden.
     pub read_only: bool,
+    /// Currently-selected app theme (highlighted with a check in the menu).
+    pub app_theme: AppTheme,
+    /// Currently-selected editor theme (highlighted with a check in the menu).
+    pub editor_theme: EditorTheme,
 }
 
 impl Default for MenuContext {
@@ -80,6 +88,8 @@ impl Default for MenuContext {
             supports_hunk_nav: true,
             supports_editor: true,
             read_only: false,
+            app_theme: AppTheme::Auto,
+            editor_theme: EditorTheme::default(),
         }
     }
 }
@@ -249,6 +259,36 @@ pub fn render_menubar(
                     if shortcut_button(ui, "Reset", Some(&SC_FONT_RESET)).clicked() {
                         out.push(MenuAction::ResetFontSize);
                         ui.close_menu();
+                    }
+                });
+                ui.menu_button("App Theme", |ui| {
+                    for (label, theme) in [
+                        ("Auto (follow OS)", AppTheme::Auto),
+                        ("Light", AppTheme::Light),
+                        ("Dark", AppTheme::Dark),
+                    ] {
+                        let mark = if ctx.app_theme == theme {
+                            "✔ "
+                        } else {
+                            "   "
+                        };
+                        if ui.button(format!("{mark}{label}")).clicked() {
+                            out.push(MenuAction::SetAppTheme(theme));
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Editor Theme", |ui| {
+                    for theme in EditorTheme::all() {
+                        let mark = if ctx.editor_theme == *theme {
+                            "✔ "
+                        } else {
+                            "   "
+                        };
+                        if ui.button(format!("{mark}{}", theme.label())).clicked() {
+                            out.push(MenuAction::SetEditorTheme(*theme));
+                            ui.close_menu();
+                        }
                     }
                 });
             });
