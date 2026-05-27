@@ -30,6 +30,7 @@ pub mod error;
 pub mod folder;
 pub mod highlight;
 pub mod merge;
+pub mod recent;
 
 pub use blame::{BLAME_LINE_CAP, BlameCache, BlameInfo};
 pub use diff::{
@@ -45,3 +46,4 @@ pub use highlight::{
     SyntectHighlighter,
 };
 pub use merge::{MergeRegion, ThreeWayMerge};
+pub use recent::{MAX_RECENT, RecentEntry, RecentList, RecentMode};

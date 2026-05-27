@@ -34,6 +34,11 @@ first-class support for use as `git difftool` and `git mergetool`.
 - **Per-hunk Copy buttons** in the center column: **→** copies the LEFT
   side of a hunk into the RIGHT pane, **←** does the reverse. Diff
   re-renders via the same debounce as live editing.
+- **Menubar** with File / Edit / View / Help. Open new files
+  (`Ctrl+O`) or folders (`Ctrl+Shift+O`) via native pickers, reopen any
+  of the last 10 pairs from **File → Open Recent** (persisted to
+  `~/.config/lgtm/recent.tsv` by default; override with
+  `$LGTM_CONFIG_DIR`), pop About + Keyboard Shortcuts modals.
 - **Three-way merge** built for `git mergetool`. Each conflict gets
   Take LOCAL / Take REMOTE / Take BOTH (either order) / Take BASE
   buttons and an editable per-conflict resolution. Saving with

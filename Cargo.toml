@@ -50,6 +50,9 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # Date / time arithmetic for blame display
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Native file dialogs (menubar "Open Files..." / "Open Folder...")
+rfd = "0.15"
+
 # Internal crates
 lgtm-core = { path = "crates/lgtm-core", version = "0.1.0" }
 lgtm-gui  = { path = "crates/lgtm-gui",  version = "0.1.0" }

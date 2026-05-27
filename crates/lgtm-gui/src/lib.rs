@@ -6,7 +6,9 @@
 //!
 //! All view code lives here; `lgtm-core` knows nothing about egui.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) so individual test modules can opt back in for
+// Rust 2024's unsafe env::set_var (used to isolate per-process config).
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::path::PathBuf;
@@ -15,11 +17,13 @@ use lgtm_core::{AlignedDiff, DiffDocument, EditorLauncher, FolderDiff, ThreeWayM
 
 mod diff_app;
 mod folder_app;
+mod menubar;
 mod merge_app;
 mod theme;
 
 pub use diff_app::DiffApp;
 pub use folder_app::{FolderApp, FolderFilters};
+pub use menubar::{MenuAction, MenuContext, render_menubar};
 pub use merge_app::{MergeApp, MergeExit};
 
 /// Outcome of a GUI session, mapped by the CLI to a process exit code.
@@ -54,6 +58,18 @@ pub fn run_diff(
     } else {
         GuiOutcome::Differs
     };
+
+    // Record the initial pair into the persistent recents store so a
+    // user who opened these files from the CLI can re-open them next
+    // session via File → Open Recent.
+    let initial = lgtm_core::RecentEntry::new(
+        lgtm_core::RecentMode::File,
+        left.path.clone(),
+        right.path.clone(),
+    );
+    let mut recents = lgtm_core::RecentList::load();
+    recents.push(initial);
+    let _ = recents.save();
 
     let diff = AlignedDiff::compute(&left, &right).with_inline();
     let mut app = DiffApp::new(left, right, diff, read_only);

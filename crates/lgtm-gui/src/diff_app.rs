@@ -1,5 +1,9 @@
 //! Two-file diff window.
 
+// The test module needs unsafe { env::set_var(...) } (Rust 2024) to
+// isolate the recent-files config dir. Everything else stays safe.
+#![allow(unsafe_code)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,10 +11,11 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
 use lgtm_core::{
     AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, Highlighter,
-    HunkKind, InlineChangeKind, Side, StyledSpan, SyntectHighlighter, extract_lines,
-    resolve_real_path, splice_lines,
+    HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Side, StyledSpan,
+    SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
 };
 
+use crate::menubar::{self, MenuAction, MenuContext};
 use crate::theme;
 
 /// Recompute the diff after this much idle time once an edit has landed.
@@ -92,6 +97,22 @@ pub struct DiffApp {
     hover_focus: Option<HoverFocus>,
     /// Transient editor-launch error to render in the status bar.
     editor_status: Option<String>,
+    /// In-memory mirror of the on-disk recent-files list.
+    recents: RecentList,
+    /// "About" modal visibility.
+    show_about: bool,
+    /// "Keyboard Shortcuts" modal visibility.
+    show_shortcuts: bool,
+    /// Pending Open-Files request, drained after the modal confirms (if
+    /// the doc is dirty) and the rfd picker runs. `Some((Files,))` or
+    /// `Some((Folders,))` is set by the menu action handler.
+    pending_open: Option<OpenRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenRequest {
+    Files,
+    Folders,
 }
 
 impl DiffApp {
@@ -146,6 +167,10 @@ impl DiffApp {
             blame_cache: BlameCache::new(),
             hover_focus: None,
             editor_status: None,
+            recents: RecentList::load(),
+            show_about: false,
+            show_shortcuts: false,
+            pending_open: None,
         }
     }
 
@@ -164,6 +189,125 @@ impl DiffApp {
     pub fn with_editor(mut self, editor: EditorLauncher) -> Self {
         self.editor = Some(editor);
         self
+    }
+
+    /// Replace both documents in-place: reset state, recompute the diff,
+    /// rebuild syntax caches, and reset the blame cache (so the new file
+    /// pair is blamed against the new repo on next hover).
+    pub fn swap_documents(&mut self, left: DiffDocument, right: DiffDocument) {
+        // Re-resolve the real working-tree paths against repo_root if set.
+        if let Some(repo) = self.repo_root.clone() {
+            self.real_left = resolve_real_path(&repo, &left.path);
+            self.real_right = resolve_real_path(&repo, &right.path);
+        } else {
+            self.real_left = None;
+            self.real_right = None;
+        }
+        self.left = left;
+        self.right = right;
+        self.modified_left = false;
+        self.modified_right = false;
+        self.current_hunk = 0;
+        self.hover_focus = None;
+        self.blame_cache = BlameCache::new();
+        self.diff = AlignedDiff::compute(&self.left, &self.right).with_inline();
+        self.refresh_highlights();
+        // Record into the recent list and persist.
+        let entry = RecentEntry::new(
+            RecentMode::File,
+            self.left.path.clone(),
+            self.right.path.clone(),
+        );
+        self.recents.push(entry);
+        let _ = self.recents.save();
+    }
+
+    /// Dispatch a [`MenuAction`] emitted by the menubar.
+    pub fn handle_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::OpenFiles => self.pending_open = Some(OpenRequest::Files),
+            MenuAction::OpenFolders => self.pending_open = Some(OpenRequest::Folders),
+            MenuAction::OpenRecent(entry) => self.open_recent(entry),
+            MenuAction::ClearRecent => {
+                self.recents.clear();
+                let _ = self.recents.save();
+            }
+            MenuAction::Save => {
+                if let Err(e) = self.save() {
+                    tracing::error!("save failed: {e}");
+                }
+            }
+            MenuAction::Quit => {
+                self.close_requested = true;
+            }
+            MenuAction::ToggleEditMode => {
+                if !self.read_only {
+                    self.edit_mode = !self.edit_mode;
+                }
+            }
+            MenuAction::OpenInEditor => self.launch_editor(false),
+            MenuAction::OpenBothInEditor => self.launch_editor(true),
+            MenuAction::NextHunk => self.jump_hunk(1),
+            MenuAction::PrevHunk => self.jump_hunk(-1),
+            MenuAction::FirstHunk => self.jump_first(),
+            MenuAction::LastHunk => self.jump_last(),
+            MenuAction::ShowShortcuts => self.show_shortcuts = true,
+            MenuAction::ShowAbout => self.show_about = true,
+        }
+    }
+
+    fn open_recent(&mut self, entry: RecentEntry) {
+        match entry.mode {
+            RecentMode::File => {
+                let l = match DiffDocument::load(&entry.left) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.editor_status =
+                            Some(format!("Could not open {}: {e}", entry.left.display()));
+                        return;
+                    }
+                };
+                let r = match DiffDocument::load(&entry.right) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.editor_status =
+                            Some(format!("Could not open {}: {e}", entry.right.display()));
+                        return;
+                    }
+                };
+                self.swap_documents(l, r);
+            }
+            RecentMode::Folder => self.spawn_folder_window(&entry.left, &entry.right),
+        }
+    }
+
+    /// Spawn a new lgtm process in folder mode. The current DiffApp is a
+    /// file-mode window; folder mode is a separate window type, so we
+    /// shell out to ourselves rather than restructure.
+    fn spawn_folder_window(&mut self, left: &std::path::Path, right: &std::path::Path) {
+        let me = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.editor_status = Some(format!("Could not locate lgtm binary: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = std::process::Command::new(me)
+            .arg("--dir")
+            .arg(left)
+            .arg(right)
+            .spawn()
+        {
+            self.editor_status = Some(format!("Could not spawn lgtm folder window: {e}"));
+            return;
+        }
+        // Record + persist.
+        self.recents.push(RecentEntry::new(
+            RecentMode::Folder,
+            left.to_path_buf(),
+            right.to_path_buf(),
+        ));
+        let _ = self.recents.save();
     }
 
     /// Apply a per-hunk copy: rewrite the destination pane so the hunk's
@@ -640,15 +784,26 @@ impl eframe::App for DiffApp {
         let mut last = false;
         let mut want_save = false;
         let mut want_open: Option<bool> = None; // Some(true) = both panes
+        let mut want_open_files = false;
+        let mut want_open_folders = false;
         ctx.input(|i| {
             if i.modifiers.command_only() && i.key_pressed(Key::S) {
                 want_save = true;
+            }
+            if i.modifiers.command_only() && i.key_pressed(Key::O) {
+                want_open_files = true;
+            }
+            if i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::O) {
+                want_open_folders = true;
+            }
+            if i.modifiers.command_only() && i.key_pressed(Key::Q) {
+                self.close_requested = true;
             }
             if i.key_pressed(Key::Escape) {
                 self.close_requested = true;
             }
             if !self.edit_mode {
-                if i.key_pressed(Key::Q) {
+                if i.key_pressed(Key::Q) && !i.modifiers.command {
                     self.close_requested = true;
                 }
                 if i.key_pressed(Key::N) {
@@ -670,6 +825,12 @@ impl eframe::App for DiffApp {
         });
         if let Some(both) = want_open {
             self.launch_editor(both);
+        }
+        if want_open_files {
+            self.pending_open = Some(OpenRequest::Files);
+        }
+        if want_open_folders {
+            self.pending_open = Some(OpenRequest::Folders);
         }
         if want_save {
             if let Err(e) = self.save() {
@@ -707,6 +868,30 @@ impl eframe::App for DiffApp {
             }
         }
 
+        // Menubar (File / Edit / View / Help) sits above the title.
+        let mut actions: Vec<MenuAction> = Vec::new();
+        egui::TopBottomPanel::top("lgtm-menubar").show(ctx, |ui| {
+            let mctx = MenuContext {
+                dirty: self.is_dirty(),
+                supports_edit_mode: true,
+                in_edit_mode: self.edit_mode,
+                supports_hunk_nav: true,
+                supports_editor: self.editor.is_some(),
+                read_only: self.read_only,
+            };
+            crate::menubar::render_menubar(ui, mctx, &self.recents, &mut actions);
+        });
+        for action in actions {
+            self.handle_menu_action(action);
+        }
+
+        // Drain any pending Open Files / Open Folders request raised
+        // from the menu. Native dialogs are blocking but the user-perceived
+        // wait is acceptable for a click-driven flow.
+        if let Some(req) = self.pending_open.take() {
+            self.run_open_dialog(req);
+        }
+
         egui::TopBottomPanel::top("lgtm-title").show(ctx, |ui| {
             ui.heading(self.title());
             self.render_toolbar(ui);
@@ -727,10 +912,109 @@ impl eframe::App for DiffApp {
         if self.show_confirm_quit {
             self.render_confirm_quit(ctx);
         }
+        if self.show_about {
+            self.render_about(ctx);
+        }
+        if self.show_shortcuts {
+            self.render_shortcuts(ctx);
+        }
     }
 }
 
 impl DiffApp {
+    fn run_open_dialog(&mut self, req: OpenRequest) {
+        match req {
+            OpenRequest::Files => {
+                let left = match rfd::FileDialog::new()
+                    .set_title("lgtm — pick LEFT file")
+                    .pick_file()
+                {
+                    Some(p) => p,
+                    None => return,
+                };
+                let right = match rfd::FileDialog::new()
+                    .set_title("lgtm — pick RIGHT file")
+                    .pick_file()
+                {
+                    Some(p) => p,
+                    None => return,
+                };
+                let l = match DiffDocument::load(&left) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.editor_status =
+                            Some(format!("Could not open {}: {e}", left.display()));
+                        return;
+                    }
+                };
+                let r = match DiffDocument::load(&right) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.editor_status =
+                            Some(format!("Could not open {}: {e}", right.display()));
+                        return;
+                    }
+                };
+                self.swap_documents(l, r);
+            }
+            OpenRequest::Folders => {
+                let left = match rfd::FileDialog::new()
+                    .set_title("lgtm — pick LEFT folder")
+                    .pick_folder()
+                {
+                    Some(p) => p,
+                    None => return,
+                };
+                let right = match rfd::FileDialog::new()
+                    .set_title("lgtm — pick RIGHT folder")
+                    .pick_folder()
+                {
+                    Some(p) => p,
+                    None => return,
+                };
+                self.spawn_folder_window(&left, &right);
+            }
+        }
+    }
+
+    fn render_about(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("About lgtm")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(menubar::about_body()).monospace());
+                ui.separator();
+                ui.label("the diff tool that lets you say lgtm with confidence.");
+                if ui.button("OK").clicked() {
+                    self.show_about = false;
+                }
+            });
+        if !open {
+            self.show_about = false;
+        }
+    }
+
+    fn render_shortcuts(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("Keyboard Shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(menubar::shortcuts_body()).monospace());
+                if ui.button("OK").clicked() {
+                    self.show_shortcuts = false;
+                }
+            });
+        if !open {
+            self.show_shortcuts = false;
+        }
+    }
+
     fn render_confirm_quit(&mut self, ctx: &egui::Context) {
         let mut open = true;
         egui::Window::new("Unsaved changes")
@@ -1263,7 +1547,29 @@ mod tests {
         );
     }
 
+    /// Redirect LGTM_CONFIG_DIR to a per-process temp dir so recent-list
+    /// writes from `swap_documents` / `ClearRecent` don't touch the
+    /// developer's real `~/.config/lgtm/recent.tsv`.
+    fn isolate_config_dir_once() {
+        use std::sync::OnceLock;
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!("lgtm-diffapp-tests-{nanos}"));
+            std::fs::create_dir_all(&p).unwrap();
+            // SAFETY: protected by OnceLock; runs exactly once per process,
+            // before any test touches RecentList.
+            unsafe {
+                std::env::set_var("LGTM_CONFIG_DIR", &p);
+            }
+        });
+    }
+
     fn fixture(left: &str, right: &str) -> DiffApp {
+        isolate_config_dir_once();
         let l = DiffDocument::empty_for("l");
         let mut l = l;
         l.content = left.into();
@@ -1676,6 +1982,77 @@ mod tests {
             .map(|s| &job.text[s.byte_range.clone()])
             .collect();
         assert_eq!(texts, vec!["abc"]);
+    }
+
+    // ---- menubar dispatch ------------------------------------------
+
+    #[test]
+    fn swap_documents_replaces_both_panes_and_recomputes() {
+        let mut app = fixture("a\n", "a\n");
+        // The fixture has no hunks; new content has one.
+        let mut nl = DiffDocument::empty_for("nl");
+        nl.content = "a\nLOCAL\nb\n".into();
+        let mut nr = DiffDocument::empty_for("nr");
+        nr.content = "a\nREMOTE\nb\n".into();
+        app.swap_documents(nl, nr);
+        assert_eq!(app.left.content, "a\nLOCAL\nb\n");
+        assert_eq!(app.right.content, "a\nREMOTE\nb\n");
+        assert_eq!(app.diff.hunks.len(), 1);
+        assert!(!app.is_dirty(), "fresh load is never dirty");
+    }
+
+    #[test]
+    fn handle_menu_action_toggle_edit_mode_flips() {
+        let mut app = fixture("a\n", "b\n");
+        assert!(!app.edit_mode);
+        app.handle_menu_action(MenuAction::ToggleEditMode);
+        assert!(app.edit_mode);
+        app.handle_menu_action(MenuAction::ToggleEditMode);
+        assert!(!app.edit_mode);
+    }
+
+    #[test]
+    fn handle_menu_action_toggle_edit_mode_is_noop_when_read_only() {
+        let mut app = fixture("a\n", "b\n");
+        app.read_only = true;
+        app.handle_menu_action(MenuAction::ToggleEditMode);
+        assert!(!app.edit_mode);
+    }
+
+    #[test]
+    fn handle_menu_action_show_modals_flags_set() {
+        let mut app = fixture("a\n", "b\n");
+        app.handle_menu_action(MenuAction::ShowAbout);
+        assert!(app.show_about);
+        app.handle_menu_action(MenuAction::ShowShortcuts);
+        assert!(app.show_shortcuts);
+    }
+
+    #[test]
+    fn handle_menu_action_hunk_nav_drives_jump_methods() {
+        let mut app = fixture("a\nb\nc\nd\n", "X\nb\nY\nd\n");
+        assert_eq!(app.diff.hunks.len(), 2);
+        app.handle_menu_action(MenuAction::NextHunk);
+        assert_eq!(app.current_hunk, 1);
+        app.handle_menu_action(MenuAction::FirstHunk);
+        assert_eq!(app.current_hunk, 0);
+        app.handle_menu_action(MenuAction::LastHunk);
+        assert_eq!(app.current_hunk, 1);
+        app.handle_menu_action(MenuAction::PrevHunk);
+        assert_eq!(app.current_hunk, 0);
+    }
+
+    #[test]
+    fn handle_menu_action_clear_recent_empties_list() {
+        let mut app = fixture("a\n", "b\n");
+        let mut nl = DiffDocument::empty_for("nl");
+        nl.content = "x".into();
+        let mut nr = DiffDocument::empty_for("nr");
+        nr.content = "y".into();
+        app.swap_documents(nl, nr);
+        assert!(app.recents.entries().count() >= 1);
+        app.handle_menu_action(MenuAction::ClearRecent);
+        assert!(app.recents.is_empty());
     }
 
     #[test]
