@@ -31,6 +31,9 @@ first-class support for use as `git difftool` and `git mergetool`.
 - **Live editing** of either pane with a 150 ms debounced re-diff;
   Ctrl+S saves back to disk preserving the original encoding and line
   endings.
+- **Per-hunk Copy buttons** in the center column: **→** copies the LEFT
+  side of a hunk into the RIGHT pane, **←** does the reverse. Diff
+  re-renders via the same debounce as live editing.
 - **Three-way merge** built for `git mergetool`. Each conflict gets
   Take LOCAL / Take REMOTE / Take BOTH (either order) / Take BASE
   buttons and an editable per-conflict resolution. Saving with

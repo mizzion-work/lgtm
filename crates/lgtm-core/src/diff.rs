@@ -124,6 +124,119 @@ pub struct HunkRange {
     pub kind: HunkKind,
 }
 
+impl HunkRange {
+    /// Range of 1-based **left** line numbers covered by this hunk,
+    /// end-exclusive. For a pure-Insert hunk (no left content), returns
+    /// an empty range at the correct insertion point so it can be passed
+    /// straight to [`splice_lines`].
+    pub fn left_line_range(&self, rows: &[DiffRow]) -> std::ops::Range<usize> {
+        line_range_for_side(self, rows, Side::Left)
+    }
+
+    /// Range of 1-based **right** line numbers covered by this hunk,
+    /// end-exclusive. See [`left_line_range`](Self::left_line_range) for
+    /// pure-Delete behavior.
+    pub fn right_line_range(&self, rows: &[DiffRow]) -> std::ops::Range<usize> {
+        line_range_for_side(self, rows, Side::Right)
+    }
+}
+
+fn row_line(row: &DiffRow, side: Side) -> Option<usize> {
+    match (row, side) {
+        (DiffRow::Equal { left_line, .. }, Side::Left) => Some(*left_line),
+        (DiffRow::Equal { right_line, .. }, Side::Right) => Some(*right_line),
+        (DiffRow::Delete { left_line, .. }, Side::Left) => Some(*left_line),
+        (DiffRow::Insert { right_line, .. }, Side::Right) => Some(*right_line),
+        (DiffRow::Replace { left_line, .. }, Side::Left) => Some(*left_line),
+        (DiffRow::Replace { right_line, .. }, Side::Right) => Some(*right_line),
+        _ => None,
+    }
+}
+
+fn line_range_for_side(hunk: &HunkRange, rows: &[DiffRow], side: Side) -> std::ops::Range<usize> {
+    let mut min: Option<usize> = None;
+    let mut max: Option<usize> = None;
+    for row in &rows[hunk.start_row..hunk.end_row] {
+        if let Some(n) = row_line(row, side) {
+            min = Some(min.map_or(n, |m| m.min(n)));
+            max = Some(max.map_or(n, |m| m.max(n)));
+        }
+    }
+    if let (Some(lo), Some(hi)) = (min, max) {
+        return lo..(hi + 1);
+    }
+    // No content on this side within the hunk: find the previous line on
+    // this side and use the position after it as the insertion point.
+    let mut prev: usize = 0;
+    for row in &rows[..hunk.start_row] {
+        if let Some(n) = row_line(row, side) {
+            prev = n;
+        }
+    }
+    let insertion = prev + 1;
+    insertion..insertion
+}
+
+/// Extract the substring of `content` covering the 1-based, end-exclusive
+/// `line_range`. Lines include their trailing `\n`. An empty range
+/// returns `""`.
+///
+/// `line_range.end` past the last line clamps to end-of-content.
+pub fn extract_lines(content: &str, line_range: std::ops::Range<usize>) -> String {
+    if line_range.start >= line_range.end {
+        return String::new();
+    }
+    let (start, end) = byte_offsets_for(content, line_range);
+    content[start..end].to_string()
+}
+
+/// Replace lines `line_range` in `content` with `replacement`. An empty
+/// `line_range` means "insert at this position". `line_range.end` past
+/// EOF clamps to end-of-content.
+pub fn splice_lines(
+    content: &str,
+    line_range: std::ops::Range<usize>,
+    replacement: &str,
+) -> String {
+    let (start, end) = byte_offsets_for(content, line_range);
+    let mut out = String::with_capacity(content.len() - (end - start) + replacement.len());
+    out.push_str(&content[..start]);
+    out.push_str(replacement);
+    out.push_str(&content[end..]);
+    out
+}
+
+/// Convert a 1-based line range (end-exclusive) into the matching byte
+/// offsets in `content`. Out-of-range starts/ends clamp to `content.len()`.
+/// An empty `line_range` returns `(byte_at_start, byte_at_start)`.
+fn byte_offsets_for(content: &str, line_range: std::ops::Range<usize>) -> (usize, usize) {
+    if line_range.start == 0 {
+        // Line numbers are 1-based; treat 0 like 1 for caller robustness.
+        let r = 1..line_range.end.max(1);
+        return byte_offsets_for(content, r);
+    }
+    let target_start = line_range.start;
+    let target_end = line_range.end.max(target_start);
+    let mut start = content.len();
+    let mut end = content.len();
+    let mut cursor = 0usize;
+    for (i, line) in content.split_inclusive('\n').enumerate() {
+        let n = i + 1; // 1-based line number
+        if n == target_start {
+            start = cursor;
+        }
+        if n == target_end {
+            end = cursor;
+        }
+        cursor += line.len();
+    }
+    // If the range starts past EOF, both clamp to EOF (empty insertion).
+    if start > end {
+        start = end;
+    }
+    (start, end)
+}
+
 /// Summary statistics for an [`AlignedDiff`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiffStats {
@@ -581,5 +694,151 @@ mod tests {
         let d = AlignedDiff::compute_from_text("a\nx\nc\n", "a\ny\nc\n");
         assert_eq!(d.hunks.len(), 1);
         assert_eq!(d.hunks[0].kind, HunkKind::Replace);
+    }
+
+    // ---- extract_lines / splice_lines -------------------------------
+
+    #[test]
+    fn extract_lines_empty_range_yields_empty_string() {
+        assert_eq!(extract_lines("a\nb\nc\n", 2..2), "");
+        // Reversed/degenerate range also yields empty (defensive).
+        #[allow(clippy::reversed_empty_ranges)]
+        let degen = 5..3;
+        assert_eq!(extract_lines("a\nb\nc\n", degen), "");
+    }
+
+    #[test]
+    fn extract_lines_middle_range() {
+        assert_eq!(extract_lines("a\nb\nc\nd\n", 2..4), "b\nc\n");
+    }
+
+    #[test]
+    fn extract_lines_full_file() {
+        assert_eq!(extract_lines("a\nb\nc\n", 1..4), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn extract_lines_past_eof_clamps() {
+        assert_eq!(extract_lines("a\nb\n", 2..9999), "b\n");
+    }
+
+    #[test]
+    fn extract_lines_no_trailing_newline() {
+        // last line lacks \n; it must still be extractable.
+        assert_eq!(extract_lines("a\nb\nc", 3..4), "c");
+        assert_eq!(extract_lines("a\nb\nc", 2..4), "b\nc");
+    }
+
+    #[test]
+    fn splice_lines_replace_middle() {
+        let out = splice_lines("a\nb\nc\nd\n", 2..4, "X\nY\n");
+        assert_eq!(out, "a\nX\nY\nd\n");
+    }
+
+    #[test]
+    fn splice_lines_replace_at_start() {
+        let out = splice_lines("a\nb\nc\n", 1..2, "FIRST\n");
+        assert_eq!(out, "FIRST\nb\nc\n");
+    }
+
+    #[test]
+    fn splice_lines_replace_at_end() {
+        let out = splice_lines("a\nb\nc\n", 3..4, "LAST\n");
+        assert_eq!(out, "a\nb\nLAST\n");
+    }
+
+    #[test]
+    fn splice_lines_insertion_via_empty_range() {
+        // Insert "X\n" before line 2.
+        let out = splice_lines("a\nb\nc\n", 2..2, "X\n");
+        assert_eq!(out, "a\nX\nb\nc\n");
+    }
+
+    #[test]
+    fn splice_lines_append_past_eof() {
+        // Inserting at a line one past EOF means appending.
+        let out = splice_lines("a\nb\n", 3..3, "C\n");
+        assert_eq!(out, "a\nb\nC\n");
+    }
+
+    #[test]
+    fn splice_lines_removal() {
+        // Replace with empty: deletes the lines.
+        let out = splice_lines("a\nb\nc\n", 2..3, "");
+        assert_eq!(out, "a\nc\n");
+    }
+
+    #[test]
+    fn splice_lines_replacement_without_trailing_newline_preserves_shape() {
+        // Replacing the last line of a file without trailing \n.
+        let out = splice_lines("a\nb\nc", 3..4, "Z");
+        assert_eq!(out, "a\nb\nZ");
+    }
+
+    #[test]
+    fn extract_then_splice_round_trips() {
+        let s = "alpha\nbeta\ngamma\ndelta\n";
+        let block = extract_lines(s, 2..4);
+        let out = splice_lines(s, 2..4, &block);
+        assert_eq!(out, s);
+    }
+
+    // ---- HunkRange line ranges --------------------------------------
+
+    #[test]
+    fn hunk_left_line_range_replace() {
+        let d = AlignedDiff::compute_from_text("a\nb\nc\n", "a\nB\nc\n");
+        let h = d.hunks[0];
+        assert_eq!(h.left_line_range(&d.rows), 2..3);
+        assert_eq!(h.right_line_range(&d.rows), 2..3);
+    }
+
+    #[test]
+    fn hunk_left_line_range_pure_insert_is_empty_at_insertion_point() {
+        let d = AlignedDiff::compute_from_text("a\nb\n", "a\nX\nY\nb\n");
+        assert_eq!(d.hunks.len(), 1);
+        let h = d.hunks[0];
+        // The insert lands between left lines 1 and 2 → empty range at 2..2.
+        assert_eq!(h.left_line_range(&d.rows), 2..2);
+        assert_eq!(h.right_line_range(&d.rows), 2..4);
+    }
+
+    #[test]
+    fn hunk_right_line_range_pure_delete_is_empty_at_insertion_point() {
+        let d = AlignedDiff::compute_from_text("a\nX\nY\nb\n", "a\nb\n");
+        let h = d.hunks[0];
+        assert_eq!(h.left_line_range(&d.rows), 2..4);
+        assert_eq!(h.right_line_range(&d.rows), 2..2);
+    }
+
+    #[test]
+    fn hunk_line_range_at_very_start_is_one_one_for_missing_side() {
+        // Pure insert at the very top of the file: no prior left content.
+        let d = AlignedDiff::compute_from_text("a\n", "X\na\n");
+        let h = d.hunks[0];
+        assert_eq!(h.left_line_range(&d.rows), 1..1);
+        assert_eq!(h.right_line_range(&d.rows), 1..2);
+    }
+
+    #[test]
+    fn hunk_line_range_at_very_end() {
+        let d = AlignedDiff::compute_from_text("a\n", "a\nX\n");
+        let h = d.hunks[0];
+        assert_eq!(h.left_line_range(&d.rows), 2..2);
+        assert_eq!(h.right_line_range(&d.rows), 2..3);
+    }
+
+    #[test]
+    fn copy_left_to_right_via_extract_and_splice_matches_left() {
+        // End-to-end use of the helpers as the GUI will use them.
+        let left = "a\nLOCAL\nc\n";
+        let right = "a\nREMOTE\nc\n";
+        let d = AlignedDiff::compute_from_text(left, right);
+        let h = d.hunks[0];
+        let lr = h.left_line_range(&d.rows);
+        let rr = h.right_line_range(&d.rows);
+        let block = extract_lines(left, lr);
+        let new_right = splice_lines(right, rr, &block);
+        assert_eq!(new_right, "a\nLOCAL\nc\n");
     }
 }

@@ -7,13 +7,23 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
 use lgtm_core::{
     AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, Highlighter,
-    HunkKind, InlineChangeKind, Side, StyledSpan, SyntectHighlighter, resolve_real_path,
+    HunkKind, InlineChangeKind, Side, StyledSpan, SyntectHighlighter, extract_lines,
+    resolve_real_path, splice_lines,
 };
 
 use crate::theme;
 
 /// Recompute the diff after this much idle time once an edit has landed.
 const DIFF_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Direction of a per-hunk Copy action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyDirection {
+    /// Copy the LEFT version of the hunk over the RIGHT pane.
+    LeftToRight,
+    /// Copy the RIGHT version of the hunk over the LEFT pane.
+    RightToLeft,
+}
 
 /// What the user is currently hovering, for status-bar display and for
 /// `e` to know which file + line to open in the editor.
@@ -154,6 +164,35 @@ impl DiffApp {
     pub fn with_editor(mut self, editor: EditorLauncher) -> Self {
         self.editor = Some(editor);
         self
+    }
+
+    /// Apply a per-hunk copy: rewrite the destination pane so the hunk's
+    /// region equals the source pane's region.
+    ///
+    /// No-op if `hunk_idx` is out of range or `read_only` is true. The
+    /// existing debounced re-diff picks up the new content automatically
+    /// because [`Self::mark_edited`] sets `last_edit_at`.
+    pub fn copy_hunk(&mut self, hunk_idx: usize, dir: CopyDirection) {
+        if self.read_only {
+            return;
+        }
+        let Some(hunk) = self.diff.hunks.get(hunk_idx).copied() else {
+            return;
+        };
+        let lr = hunk.left_line_range(&self.diff.rows);
+        let rr = hunk.right_line_range(&self.diff.rows);
+        match dir {
+            CopyDirection::LeftToRight => {
+                let block = extract_lines(&self.left.content, lr);
+                self.right.content = splice_lines(&self.right.content, rr, &block);
+                self.mark_edited(Side::Right);
+            }
+            CopyDirection::RightToLeft => {
+                let block = extract_lines(&self.right.content, rr);
+                self.left.content = splice_lines(&self.left.content, lr, &block);
+                self.mark_edited(Side::Left);
+            }
+        }
     }
 
     /// Launch the configured editor on the currently-focused pane.
@@ -469,6 +508,15 @@ impl DiffApp {
             scroll = scroll.vertical_scroll_offset((row as f32 * row_height) - 60.0);
         }
 
+        // Build a row_idx → Option<hunk_idx> lookup so render_row_with_blame
+        // can show Copy buttons only on the first row of each hunk.
+        let mut hunk_at_row_start: Vec<Option<usize>> = vec![None; total];
+        for (i, hunk) in self.diff.hunks.iter().enumerate() {
+            if let Some(slot) = hunk_at_row_start.get_mut(hunk.start_row) {
+                *slot = Some(i);
+            }
+        }
+
         // Disjoint borrows so the show_rows closure can mutate blame_cache
         // while reading the diff + syntax caches + paths.
         let diff = &self.diff;
@@ -478,12 +526,15 @@ impl DiffApp {
         let left_path = self.left.path.clone();
         let right_path = self.right.path.clone();
         let repo_root = self.repo_root.clone();
+        let read_only = self.read_only;
         let mut hover_focus: Option<HoverFocus> = None;
+        let mut pending_copy: Option<(usize, CopyDirection)> = None;
 
         scroll.show_rows(ui, row_height, total, |ui, row_range| {
             ui.style_mut().override_font_id = Some(FontId::monospace(13.0));
             for idx in row_range {
                 let row = &diff.rows[idx];
+                let hunk_idx = hunk_at_row_start.get(idx).copied().flatten();
                 render_row_with_blame(
                     ui,
                     row,
@@ -495,11 +546,17 @@ impl DiffApp {
                     &left_path,
                     &right_path,
                     &mut hover_focus,
+                    hunk_idx,
+                    read_only,
+                    &mut pending_copy,
                 );
             }
         });
 
         self.hover_focus = hover_focus;
+        if let Some((i, dir)) = pending_copy {
+            self.copy_hunk(i, dir);
+        }
     }
 
     fn render_minimap(&mut self, ui: &mut egui::Ui) {
@@ -701,6 +758,9 @@ fn render_binary_stub(ui: &mut egui::Ui, left: &DiffDocument, right: &DiffDocume
     });
 }
 
+/// Width of the center column hosting per-hunk Copy buttons.
+const CENTER_COL_WIDTH: f32 = 56.0;
+
 #[allow(clippy::too_many_arguments)]
 fn render_row_with_blame(
     ui: &mut egui::Ui,
@@ -713,10 +773,13 @@ fn render_row_with_blame(
     left_path: &std::path::Path,
     right_path: &std::path::Path,
     hover_focus: &mut Option<HoverFocus>,
+    hunk_idx: Option<usize>,
+    read_only: bool,
+    pending_copy: &mut Option<(usize, CopyDirection)>,
 ) {
     let bg = row_background(row);
     let avail = ui.available_width();
-    let half = (avail - 8.0) * 0.5;
+    let half = (avail - CENTER_COL_WIDTH) * 0.5;
 
     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(avail, row_height), Sense::hover());
     if bg != Color32::TRANSPARENT {
@@ -748,7 +811,7 @@ fn render_row_with_blame(
         &parts.inline_left,
         left_spans,
     );
-    child.add(egui::Separator::default().vertical().spacing(8.0));
+    render_center_column(&mut child, row_height, hunk_idx, read_only, pending_copy);
     let right_resp = render_pane(
         &mut child,
         half,
@@ -847,6 +910,57 @@ fn render_pane(
         ui.id().with(("pane", line_num, side_tag)),
         Sense::hover(),
     )
+}
+
+/// Render the fixed-width column between the panes. On the first row of
+/// each hunk (when not read-only), draws two compact Copy buttons; on
+/// every other row, a thin vertical separator. The two-state design
+/// keeps the visual rhythm of the diff unbroken while making every
+/// hunk one click away from being accepted on either side.
+fn render_center_column(
+    ui: &mut egui::Ui,
+    row_height: f32,
+    hunk_idx: Option<usize>,
+    read_only: bool,
+    pending_copy: &mut Option<(usize, CopyDirection)>,
+) {
+    let (rect, _resp) =
+        ui.allocate_exact_size(egui::vec2(CENTER_COL_WIDTH, row_height), Sense::hover());
+    // Vertical separator backdrop, drawn first so buttons sit on top.
+    let center_x = rect.center().x;
+    ui.painter().line_segment(
+        [
+            egui::pos2(center_x, rect.top()),
+            egui::pos2(center_x, rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, Color32::from_gray(0x40)),
+    );
+
+    let Some(idx) = hunk_idx else {
+        return;
+    };
+    if read_only {
+        return;
+    }
+
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    child.spacing_mut().item_spacing.x = 2.0;
+    let right_btn = child
+        .add(egui::Button::new(RichText::new("→").monospace()).small())
+        .on_hover_text("Copy this hunk: LEFT → RIGHT");
+    if right_btn.clicked() {
+        *pending_copy = Some((idx, CopyDirection::LeftToRight));
+    }
+    let left_btn = child
+        .add(egui::Button::new(RichText::new("←").monospace()).small())
+        .on_hover_text("Copy this hunk: RIGHT → LEFT");
+    if left_btn.clicked() {
+        *pending_copy = Some((idx, CopyDirection::RightToLeft));
+    }
 }
 
 /// Build a [`LayoutJob`] for one displayed line that combines syntax
@@ -1252,5 +1366,100 @@ mod tests {
         app.jump_first();
         assert_eq!(app.current_hunk, 0);
         assert!(app.pending_scroll.is_some());
+    }
+
+    // ---- per-hunk Copy ---------------------------------------------
+
+    #[test]
+    fn copy_hunk_left_to_right_rewrites_right_pane_and_marks_dirty() {
+        let mut app = fixture("a\nLOCAL\nc\n", "a\nREMOTE\nc\n");
+        assert_eq!(app.diff.hunks.len(), 1);
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        assert_eq!(app.right.content, "a\nLOCAL\nc\n");
+        assert!(app.modified_right);
+        assert!(!app.modified_left);
+        assert!(app.last_edit_at.is_some());
+    }
+
+    #[test]
+    fn copy_hunk_right_to_left_rewrites_left_pane_and_marks_dirty() {
+        let mut app = fixture("a\nLOCAL\nc\n", "a\nREMOTE\nc\n");
+        app.copy_hunk(0, CopyDirection::RightToLeft);
+        assert_eq!(app.left.content, "a\nREMOTE\nc\n");
+        assert!(app.modified_left);
+        assert!(!app.modified_right);
+    }
+
+    #[test]
+    fn copy_hunk_pure_insert_left_to_right_drops_inserted_lines() {
+        // Right has extra lines that don't exist on the left. Copy →
+        // means "make right look like left here" → delete those lines.
+        let mut app = fixture("a\nb\n", "a\nX\nY\nb\n");
+        assert_eq!(app.diff.hunks.len(), 1);
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        assert_eq!(app.right.content, "a\nb\n");
+    }
+
+    #[test]
+    fn copy_hunk_pure_insert_right_to_left_adds_lines_to_left() {
+        let mut app = fixture("a\nb\n", "a\nX\nY\nb\n");
+        app.copy_hunk(0, CopyDirection::RightToLeft);
+        assert_eq!(app.left.content, "a\nX\nY\nb\n");
+    }
+
+    #[test]
+    fn copy_hunk_pure_delete_left_to_right_restores_lines_on_right() {
+        // Left has extra lines that don't exist on right. Copy →
+        // means add them to right.
+        let mut app = fixture("a\nX\nY\nb\n", "a\nb\n");
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        assert_eq!(app.right.content, "a\nX\nY\nb\n");
+    }
+
+    #[test]
+    fn copy_hunk_then_recompute_collapses_the_hunk() {
+        let mut app = fixture("a\nLOCAL\nc\n", "a\nREMOTE\nc\n");
+        assert_eq!(app.diff.hunks.len(), 1);
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        app.recompute_diff();
+        assert_eq!(
+            app.diff.hunks.len(),
+            0,
+            "after copy both sides should match → no hunks remain"
+        );
+    }
+
+    #[test]
+    fn copy_hunk_is_noop_in_read_only_mode() {
+        let mut app = fixture("a\nLOCAL\nc\n", "a\nREMOTE\nc\n");
+        app.read_only = true;
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        assert_eq!(app.right.content, "a\nREMOTE\nc\n");
+        assert!(!app.modified_right);
+    }
+
+    #[test]
+    fn copy_hunk_out_of_range_is_silent_noop() {
+        let mut app = fixture("a\n", "a\n");
+        // No hunks at all → index 0 is OOB.
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        assert_eq!(app.right.content, "a\n");
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn copy_hunk_at_file_start_pure_insert() {
+        // The hunk lives at the very top of the file; the empty side's
+        // line range must be 1..1 (the insertion-point edge case).
+        let mut app = fixture("a\n", "X\na\n");
+        app.copy_hunk(0, CopyDirection::LeftToRight);
+        assert_eq!(app.right.content, "a\n");
+    }
+
+    #[test]
+    fn copy_hunk_at_file_end_pure_insert() {
+        let mut app = fixture("a\n", "a\nX\n");
+        app.copy_hunk(0, CopyDirection::RightToLeft);
+        assert_eq!(app.left.content, "a\nX\n");
     }
 }
