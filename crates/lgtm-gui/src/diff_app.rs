@@ -105,6 +105,10 @@ pub struct DiffApp {
     /// scroll together. Updated every frame from whichever pane the user
     /// scrolled.
     edit_scroll_y: f32,
+    /// Fraction of the edit-mode central panel given to the left pane
+    /// (0.5 = even split). Adjusted by dragging the splitter between
+    /// the two `TextEdit`s.
+    edit_split_fraction: f32,
     /// "About" modal visibility.
     show_about: bool,
     /// "Keyboard Shortcuts" modal visibility.
@@ -186,6 +190,7 @@ impl DiffApp {
             recents: RecentList::load(),
             settings: Settings::load(),
             edit_scroll_y: 0.0,
+            edit_split_fraction: 0.5,
             show_about: false,
             show_shortcuts: false,
             pending_open: None,
@@ -716,23 +721,31 @@ impl DiffApp {
     }
 
     fn render_edit_panes(&mut self, ui: &mut egui::Ui) {
-        let avail = ui.available_size();
-        let half = (avail.x - 8.0) * 0.5;
+        let total_w = ui.available_width();
+        let total_h = ui.available_height();
+        if total_w < 50.0 || total_h < 20.0 {
+            // First-frame layout: parent panel hasn't sized yet. Skip
+            // and let the next frame paint with real dimensions.
+            ui.ctx().request_repaint();
+            return;
+        }
+        let splitter_w: f32 = 6.0;
+        let min_pane: f32 = 80.0;
+        let usable = (total_w - splitter_w).max(min_pane * 2.0);
+        let left_w = (usable * self.edit_split_fraction)
+            .max(min_pane)
+            .min(usable - min_pane);
+        let right_w = usable - left_w;
         let read_only = self.read_only;
         let font_size = self.settings.font_size;
-        // Shared scroll offset across both panes for synchronized scrolling.
-        // We seed both ScrollAreas with `self.edit_scroll_y`, render them,
-        // then read whichever has changed and write the new value back —
-        // whichever pane the user scrolled this frame "wins" and the
-        // other pane catches up next frame.
         let initial_scroll = self.edit_scroll_y;
         let mut new_scroll = initial_scroll;
         let mut left_edited = false;
         let mut right_edited = false;
+        let mut drag_delta_x: f32 = 0.0;
+
         ui.horizontal_top(|ui| {
-            // Disjoint borrows: each pane gets its content + its cached
-            // syntax spans. The layouter borrows the spans immutably;
-            // the TextEdit borrows the content mutably.
+            // ---- LEFT pane --------------------------------------------
             let left_content = &mut self.left.content;
             let left_syntax = &self.cached_left_syntax;
             let mut left_layouter =
@@ -740,30 +753,51 @@ impl DiffApp {
                     let job = build_edit_layout(text, left_syntax, font_size);
                     ui.fonts(|f| f.layout_job(job))
                 };
-            ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
-                let out = ScrollArea::vertical()
-                    .id_salt("lgtm-edit-left")
-                    .auto_shrink([false, false])
-                    .vertical_scroll_offset(initial_scroll)
-                    .show(ui, |ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::multiline(left_content)
-                                .font(FontId::monospace(font_size))
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(40)
-                                .interactive(!read_only)
-                                .layouter(&mut left_layouter),
-                        );
-                        if resp.changed() {
-                            left_edited = true;
-                        }
-                    });
-                if (out.state.offset.y - initial_scroll).abs() > 0.5 {
-                    new_scroll = out.state.offset.y;
-                }
-            });
-            ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_w, total_h),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    let out = ScrollArea::vertical()
+                        .id_salt("lgtm-edit-left")
+                        .auto_shrink([false, false])
+                        .vertical_scroll_offset(initial_scroll)
+                        .show(ui, |ui| {
+                            let resp = ui.add_sized(
+                                egui::vec2(ui.available_width(), ui.available_height()),
+                                egui::TextEdit::multiline(left_content)
+                                    .font(FontId::monospace(font_size))
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(40)
+                                    .interactive(!read_only)
+                                    .layouter(&mut left_layouter),
+                            );
+                            if resp.changed() {
+                                left_edited = true;
+                            }
+                        });
+                    if (out.state.offset.y - initial_scroll).abs() > 0.5 {
+                        new_scroll = out.state.offset.y;
+                    }
+                },
+            );
+
+            // ---- SPLITTER ----------------------------------------------
+            let splitter =
+                ui.allocate_response(egui::vec2(splitter_w, total_h), Sense::click_and_drag());
+            if splitter.hovered() || splitter.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            let bar_color = if splitter.hovered() || splitter.dragged() {
+                Color32::from_rgb(0x88, 0x88, 0x88)
+            } else {
+                Color32::from_rgb(0x3c, 0x3c, 0x3c)
+            };
+            ui.painter().rect_filled(splitter.rect, 0.0, bar_color);
+            if splitter.dragged() {
+                drag_delta_x = splitter.drag_delta().x;
+            }
+
+            // ---- RIGHT pane --------------------------------------------
             let right_content = &mut self.right.content;
             let right_syntax = &self.cached_right_syntax;
             let mut right_layouter =
@@ -771,30 +805,43 @@ impl DiffApp {
                     let job = build_edit_layout(text, right_syntax, font_size);
                     ui.fonts(|f| f.layout_job(job))
                 };
-            ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
-                let out = ScrollArea::vertical()
-                    .id_salt("lgtm-edit-right")
-                    .auto_shrink([false, false])
-                    .vertical_scroll_offset(new_scroll)
-                    .show(ui, |ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::multiline(right_content)
-                                .font(FontId::monospace(font_size))
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(40)
-                                .interactive(!read_only)
-                                .layouter(&mut right_layouter),
-                        );
-                        if resp.changed() {
-                            right_edited = true;
-                        }
-                    });
-                if (out.state.offset.y - new_scroll).abs() > 0.5 {
-                    new_scroll = out.state.offset.y;
-                }
-            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_w, total_h),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    let out = ScrollArea::vertical()
+                        .id_salt("lgtm-edit-right")
+                        .auto_shrink([false, false])
+                        .vertical_scroll_offset(new_scroll)
+                        .show(ui, |ui| {
+                            let resp = ui.add_sized(
+                                egui::vec2(ui.available_width(), ui.available_height()),
+                                egui::TextEdit::multiline(right_content)
+                                    .font(FontId::monospace(font_size))
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(40)
+                                    .interactive(!read_only)
+                                    .layouter(&mut right_layouter),
+                            );
+                            if resp.changed() {
+                                right_edited = true;
+                            }
+                        });
+                    if (out.state.offset.y - new_scroll).abs() > 0.5 {
+                        new_scroll = out.state.offset.y;
+                    }
+                },
+            );
         });
+
+        // Apply drag after the layout finished so we don't fight the
+        // borrow checker in the closure above.
+        if drag_delta_x != 0.0 {
+            self.edit_split_fraction += drag_delta_x / usable.max(1.0);
+            self.edit_split_fraction = self.edit_split_fraction.clamp(0.1, 0.9);
+        }
+        let _ = (left_w, right_w);
+
         self.edit_scroll_y = new_scroll;
         if left_edited {
             self.mark_edited(Side::Left);
@@ -930,8 +977,12 @@ impl DiffApp {
 
 impl eframe::App for DiffApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keyboard shortcuts. Hunk-nav keys are inactive in edit mode so
-        // they don't fight with the TextEdit consuming `n` / `p`.
+        // Modifier-prefixed shortcuts (Ctrl+S, Ctrl+O, etc.) fire
+        // unconditionally. Bare-letter shortcuts (n, p, e, q) only fire
+        // when no widget wants keyboard input — otherwise they'd insert
+        // themselves into whatever TextEdit or find-bar input the user
+        // is typing in.
+        let typing = ctx.wants_keyboard_input();
         let mut delta: isize = 0;
         let mut first = false;
         let mut last = false;
@@ -977,7 +1028,9 @@ impl eframe::App for DiffApp {
                     self.close_requested = true;
                 }
             }
-            if !self.edit_mode {
+            // Bare-letter shortcuts: guarded against text-input focus
+            // so typing 'n' in an editor doesn't navigate hunks.
+            if !self.edit_mode && !typing {
                 if i.key_pressed(Key::Q) && !i.modifiers.command {
                     self.close_requested = true;
                 }
@@ -1425,9 +1478,15 @@ fn render_pane(
     find_ranges: &[(std::ops::Range<usize>, bool)],
     font_size: f32,
 ) -> egui::Response {
-    let resp = ui.scope(|ui| {
-        ui.set_max_width(width);
-        ui.horizontal(|ui| {
+    // Reserve exactly `width` pixels for this pane regardless of how
+    // little text is in it — otherwise short left-side lines let the
+    // center column and right pane slide leftward, breaking column
+    // alignment across rows.
+    let row_h = ui.available_height();
+    let resp = ui.allocate_ui_with_layout(
+        egui::vec2(width, row_h),
+        Layout::left_to_right(Align::Center),
+        |ui| {
             let gutter = match line_num {
                 Some(n) => format!("{n:>width$}", width = theme::GUTTER_WIDTH_CHARS),
                 None => " ".repeat(theme::GUTTER_WIDTH_CHARS),
@@ -1439,9 +1498,8 @@ fn render_pane(
             );
             let layout = build_layout(strip_nl(text), syntax, inline, find_ranges, side, font_size);
             ui.label(layout);
-        });
-    });
-    // Promote the scope to a hover-sensing rect.
+        },
+    );
     let r = resp.response.rect;
     let side_tag = if matches!(side, Side::Left) { 0u8 } else { 1u8 };
     ui.interact(

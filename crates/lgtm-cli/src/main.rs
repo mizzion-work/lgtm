@@ -72,6 +72,11 @@ struct Cli {
     /// `--editor "open -t"`.
     #[arg(long)]
     editor: Option<String>,
+
+    /// Follow symbolic links when walking folders (with cycle detection).
+    /// Only relevant in folder mode. Off by default.
+    #[arg(long)]
+    follow_symlinks: bool,
 }
 
 fn main() -> ExitCode {
@@ -122,7 +127,13 @@ fn dispatch(cli: Cli) -> anyhow::Result<u8> {
     };
 
     if folder_mode {
-        return dispatch_folder(&cli.left, &right_path, cli.no_gui, cli.quiet);
+        return dispatch_folder(
+            &cli.left,
+            &right_path,
+            cli.no_gui,
+            cli.quiet,
+            cli.follow_symlinks,
+        );
     }
 
     warn_if_large(&cli.left);
@@ -282,8 +293,17 @@ fn dispatch_merge_headless(
     }
 }
 
-fn dispatch_folder(left: &Path, right: &Path, no_gui: bool, quiet: bool) -> anyhow::Result<u8> {
-    let opts = FolderDiffOptions::default();
+fn dispatch_folder(
+    left: &Path,
+    right: &Path,
+    no_gui: bool,
+    quiet: bool,
+    follow_symlinks: bool,
+) -> anyhow::Result<u8> {
+    let opts = FolderDiffOptions {
+        follow_symlinks,
+        respect_ignore: true,
+    };
     let diff = FolderDiff::compute(left, right, &opts)?;
 
     let any_differ = diff
