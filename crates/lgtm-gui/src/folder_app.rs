@@ -175,7 +175,7 @@ impl eframe::App for FolderApp {
                 .show(ui, |ui| {
                     for e in self.visible_entries() {
                         let (badge, color) = badge_for(e.status);
-                        let resp = ui
+                        let row_resp = ui
                             .horizontal(|ui| {
                                 ui.style_mut().override_font_id =
                                     Some(FontId::monospace(font_size));
@@ -210,27 +210,40 @@ impl eframe::App for FolderApp {
                                 ui.label(RichText::new(sizes).color(theme::GUTTER_FG));
                             })
                             .response;
-                        let r = resp.rect;
-                        let interact = ui.interact(
-                            r,
-                            ui.id().with(("row", e.relative_path.clone())),
+                        // Stretch the click-sensing rect across the full
+                        // viewport width — otherwise the response rect is
+                        // only as wide as the actual labels rendered, and
+                        // for Modified rows with short paths the user has
+                        // to click *exactly* on text. Expanding the rect
+                        // makes the whole row band clickable.
+                        let click_width = row_resp.rect.width().max(ui.available_width());
+                        let full_rect = egui::Rect::from_min_size(
+                            row_resp.rect.min,
+                            egui::vec2(click_width, row_resp.rect.height()),
+                        );
+                        let click_resp = ui.interact(
+                            full_rect,
+                            ui.id().with(("row-click", e.relative_path.clone())),
                             Sense::click(),
                         );
-                        if interact.hovered() {
+                        if click_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        if interact.clicked() {
-                            let openable = matches!(
-                                e.status,
-                                FolderEntryStatus::Modified
-                                    | FolderEntryStatus::LeftOnly
-                                    | FolderEntryStatus::RightOnly
-                            );
-                            if openable {
-                                let l = left_root.join(&e.relative_path);
-                                let r = right_root.join(&e.relative_path);
-                                clicked = Some((l, r));
-                            }
+                        // Anything that has at least one side present is
+                        // openable. The child lgtm window will render
+                        // "Binary files differ" for BinaryDiffers, and
+                        // a one-sided diff (via /dev/null) for *Only.
+                        let is_openable = matches!(
+                            e.status,
+                            FolderEntryStatus::Modified
+                                | FolderEntryStatus::LeftOnly
+                                | FolderEntryStatus::RightOnly
+                                | FolderEntryStatus::BinaryDiffers
+                        );
+                        if is_openable && click_resp.clicked() {
+                            let l = left_root.join(&e.relative_path);
+                            let r = right_root.join(&e.relative_path);
+                            clicked = Some((l, r));
                         }
                     }
                 });
@@ -239,17 +252,34 @@ impl eframe::App for FolderApp {
             // Spawn a fresh file-mode lgtm window for the picked entry.
             // Use /dev/null for the absent side of LeftOnly / RightOnly.
             let l_arg = if l.exists() {
-                l
+                l.clone()
             } else {
                 std::path::PathBuf::from("/dev/null")
             };
             let r_arg = if r.exists() {
-                r
+                r.clone()
             } else {
                 std::path::PathBuf::from("/dev/null")
             };
-            if let Ok(me) = std::env::current_exe() {
-                let _ = std::process::Command::new(me).arg(l_arg).arg(r_arg).spawn();
+            match std::env::current_exe() {
+                Ok(me) => {
+                    if let Err(e) = std::process::Command::new(&me)
+                        .arg(&l_arg)
+                        .arg(&r_arg)
+                        .spawn()
+                    {
+                        tracing::error!(
+                            "failed to spawn lgtm for {} ↔ {}: {e}",
+                            l_arg.display(),
+                            r_arg.display()
+                        );
+                    } else {
+                        tracing::debug!("spawned lgtm {} {}", l_arg.display(), r_arg.display());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("could not locate lgtm binary: {e}");
+                }
             }
         }
 
