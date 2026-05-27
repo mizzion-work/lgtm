@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod blame;
 pub mod diff;
 pub mod document;
 pub mod error;
@@ -27,6 +28,7 @@ pub mod folder;
 pub mod highlight;
 pub mod merge;
 
+pub use blame::{BLAME_LINE_CAP, BlameCache, BlameInfo};
 pub use diff::{
     AlignedDiff, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange, InlineChangeKind, Side,
     unified_diff,

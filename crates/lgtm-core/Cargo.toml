@@ -14,5 +14,7 @@ content_inspector.workspace = true
 chardetng.workspace = true
 encoding_rs.workspace = true
 syntect.workspace = true
+git2.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

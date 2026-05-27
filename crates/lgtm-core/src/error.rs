@@ -60,4 +60,10 @@ pub enum Error {
     /// A folder walk failed.
     #[error("folder walk failed: {0}")]
     Walk(String),
+
+    /// A git operation failed unexpectedly. Routine cases (file not in a
+    /// repo, untracked file) are silent successes — this variant is only
+    /// returned when something is genuinely wrong (corrupt repo, etc.).
+    #[error("git: {0}")]
+    Git(String),
 }
