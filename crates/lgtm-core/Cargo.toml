@@ -16,5 +16,6 @@ encoding_rs.workspace = true
 syntect.workspace = true
 git2.workspace = true
 chrono.workspace = true
+regex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

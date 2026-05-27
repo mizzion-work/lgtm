@@ -43,7 +43,7 @@ pub use diff::{
 pub use document::{DiffDocument, HARD_SIZE_LIMIT, LineEnding, SOFT_SIZE_LIMIT};
 pub use editor::{EditorLauncher, LineArgStyle, resolve_real_path};
 pub use error::{Error, Result};
-pub use find::{FindMatch, FindState, find_matches};
+pub use find::{FindMatch, FindState, find_in_content, find_matches, find_matches_with};
 pub use folder::{FolderDiff, FolderDiffOptions, FolderEntry, FolderEntryStatus};
 pub use graph::{CommitNode, Graph, GraphEdge, MAX_COMMITS};
 pub use highlight::{

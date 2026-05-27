@@ -239,7 +239,7 @@ impl DiffApp {
         self.blame_cache = BlameCache::new();
         self.diff = AlignedDiff::compute(&self.left, &self.right).with_inline();
         self.refresh_highlights();
-        self.find.recompute(&self.diff.rows);
+        self.recompute_find();
         // Record into the recent list and persist.
         let entry = RecentEntry::new(
             RecentMode::File,
@@ -271,6 +271,9 @@ impl DiffApp {
             MenuAction::ToggleEditMode => {
                 if !self.read_only {
                     self.edit_mode = !self.edit_mode;
+                    // Find sources differ between modes — reindex now
+                    // so the count stays accurate immediately.
+                    self.recompute_find();
                 }
             }
             MenuAction::OpenInEditor => self.launch_editor(false),
@@ -512,7 +515,7 @@ impl DiffApp {
         }
         self.refresh_highlights();
         // The diff changed → find matches must be reindexed.
-        self.find.recompute(&self.diff.rows);
+        self.recompute_find();
     }
 
     fn mark_edited(&mut self, side: Side) {
@@ -637,18 +640,36 @@ impl DiffApp {
     }
 
     fn render_find_bar(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Find:").color(theme::GUTTER_FG));
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.find.query)
                     .desired_width(280.0)
-                    .hint_text("type to search both panes"),
+                    .hint_text("type to search"),
             );
             if std::mem::take(&mut self.find_focus_pending) {
                 resp.request_focus();
             }
             if resp.changed() {
-                self.find.recompute(&self.diff.rows);
+                changed = true;
+            }
+            // Aa: case sensitivity. .*: regex mode.
+            if ui
+                .selectable_label(self.find.case_sensitive, "Aa")
+                .on_hover_text("Case-sensitive (toggle)")
+                .clicked()
+            {
+                self.find.case_sensitive = !self.find.case_sensitive;
+                changed = true;
+            }
+            if ui
+                .selectable_label(self.find.use_regex, ".*")
+                .on_hover_text("Regex mode (toggle)")
+                .clicked()
+            {
+                self.find.use_regex = !self.find.use_regex;
+                changed = true;
             }
             // Enter / Shift+Enter step through matches even when the
             // input has focus.
@@ -657,6 +678,7 @@ impl DiffApp {
                     if i.key_pressed(Key::Enter) {
                         let delta = if i.modifiers.shift { -1 } else { 1 };
                         self.find.step(delta);
+                        self.scroll_to_current_find_match();
                     }
                 });
             }
@@ -666,6 +688,7 @@ impl DiffApp {
                 .clicked()
             {
                 self.find.step(-1);
+                self.scroll_to_current_find_match();
             }
             if ui
                 .small_button("▶")
@@ -673,15 +696,23 @@ impl DiffApp {
                 .clicked()
             {
                 self.find.step(1);
+                self.scroll_to_current_find_match();
             }
             let count_text = if self.find.query.is_empty() {
                 String::from("—")
+            } else if self.find.regex_invalid() {
+                String::from("invalid regex")
             } else if self.find.is_empty() {
                 String::from("no matches")
             } else {
                 format!("{} of {}", self.find.current + 1, self.find.len())
             };
-            ui.label(RichText::new(count_text).color(theme::GUTTER_FG));
+            let count_color = if self.find.regex_invalid() {
+                Color32::from_rgb(0xff, 0x80, 0x80)
+            } else {
+                theme::GUTTER_FG
+            };
+            ui.label(RichText::new(count_text).color(count_color));
             if ui
                 .small_button("✕")
                 .on_hover_text("Close find bar (Esc)")
@@ -690,8 +721,38 @@ impl DiffApp {
                 self.find.visible = false;
             }
         });
-        // Scroll the diff to the current match's row.
-        if let Some(m) = self.find.current_match() {
+        if changed {
+            self.recompute_find();
+            self.scroll_to_current_find_match();
+        }
+    }
+
+    /// Source-aware find recompute. Edit mode searches the raw pane
+    /// contents (so highlights line up with what the user sees inside
+    /// the `TextEdit`s); view mode searches the rendered diff rows.
+    pub fn recompute_find(&mut self) {
+        if self.edit_mode {
+            self.find
+                .recompute_content(&self.left.content, &self.right.content);
+        } else {
+            self.find.recompute(&self.diff.rows);
+        }
+    }
+
+    /// After a find step, scroll the current match into view.
+    /// - View mode: queue a row-level `pending_scroll` (the existing
+    ///   mechanism the diff view consumes).
+    /// - Edit mode: set `edit_scroll_y` directly so both TextEdit panes
+    ///   jump together via the shared-offset path.
+    pub fn scroll_to_current_find_match(&mut self) {
+        let Some(m) = self.find.current_match().cloned() else {
+            return;
+        };
+        if self.edit_mode {
+            let row_h = self.settings.font_size + 4.0;
+            // Center the match a third of the way down the visible area.
+            self.edit_scroll_y = (m.row as f32 * row_h - 60.0).max(0.0);
+        } else {
             self.pending_scroll = Some(m.row);
         }
     }
@@ -744,13 +805,35 @@ impl DiffApp {
         let mut right_edited = false;
         let mut drag_delta_x: f32 = 0.0;
 
+        // Pre-bucket find matches by side + content line so the layouter
+        // can color them with FIND_BG / FIND_CURRENT_BG. Find runs in
+        // edit mode against raw content (see recompute_find), so `m.row`
+        // here is a 0-based line index.
+        let left_line_count = self.left.content.split_inclusive('\n').count().max(1);
+        let right_line_count = self.right.content.split_inclusive('\n').count().max(1);
+        let mut left_finds_per_line: Vec<Vec<(std::ops::Range<usize>, bool)>> =
+            vec![Vec::new(); left_line_count];
+        let mut right_finds_per_line: Vec<Vec<(std::ops::Range<usize>, bool)>> =
+            vec![Vec::new(); right_line_count];
+        for (i, m) in self.find.matches.iter().enumerate() {
+            let is_current = self.find.visible && i == self.find.current;
+            let bucket = match m.side {
+                Side::Left => &mut left_finds_per_line,
+                Side::Right => &mut right_finds_per_line,
+            };
+            if let Some(slot) = bucket.get_mut(m.row) {
+                slot.push((m.range.clone(), is_current));
+            }
+        }
+
         ui.horizontal_top(|ui| {
             // ---- LEFT pane --------------------------------------------
             let left_content = &mut self.left.content;
             let left_syntax = &self.cached_left_syntax;
+            let left_finds_ref = &left_finds_per_line;
             let mut left_layouter =
                 move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let job = build_edit_layout(text, left_syntax, font_size);
+                    let job = build_edit_layout(text, left_syntax, left_finds_ref, font_size);
                     ui.fonts(|f| f.layout_job(job))
                 };
             ui.allocate_ui_with_layout(
@@ -800,9 +883,10 @@ impl DiffApp {
             // ---- RIGHT pane --------------------------------------------
             let right_content = &mut self.right.content;
             let right_syntax = &self.cached_right_syntax;
+            let right_finds_ref = &right_finds_per_line;
             let mut right_layouter =
                 move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let job = build_edit_layout(text, right_syntax, font_size);
+                    let job = build_edit_layout(text, right_syntax, right_finds_ref, font_size);
                     ui.fonts(|f| f.layout_job(job))
                 };
             ui.allocate_ui_with_layout(
@@ -1569,14 +1653,14 @@ fn render_center_column(
 fn build_edit_layout(
     text: &str,
     syntax: &[Vec<StyledSpan>],
+    find_ranges: &[Vec<(std::ops::Range<usize>, bool)>],
     font_size: f32,
 ) -> egui::text::LayoutJob {
     let font = FontId::monospace(font_size);
-    let plain = egui::TextFormat {
+    let plain_fmt = |bg: Color32| egui::TextFormat {
         font_id: font.clone(),
-        // PLACEHOLDER tells egui "use the surrounding text color" — i.e.
-        // honor the user's light/dark theme rather than baking in gray.
         color: Color32::PLACEHOLDER,
+        background: bg,
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
@@ -1587,50 +1671,55 @@ fn build_edit_layout(
         } else {
             line_with_nl
         };
-        let spans = syntax.get(line_idx).map(Vec::as_slice).unwrap_or(&[]);
         let line_len = line.len();
-        let max_end = spans.iter().map(|s| s.range.end).max().unwrap_or(0);
-        let stale_or_empty = spans.is_empty() || max_end > line_len;
-        if stale_or_empty {
-            job.append(line, 0.0, plain.clone());
-            if has_nl {
-                job.append("\n", 0.0, plain.clone());
+        let line_syntax = syntax.get(line_idx).map(Vec::as_slice).unwrap_or(&[]);
+        let line_finds = find_ranges.get(line_idx).map(Vec::as_slice).unwrap_or(&[]);
+        let max_syntax_end = line_syntax.iter().map(|s| s.range.end).max().unwrap_or(0);
+        let stale_syntax = line_syntax.is_empty() || max_syntax_end > line_len;
+
+        // Build a boundary set out of syntax + find ranges so each
+        // emitted segment has a single (fg, bg) attribution.
+        let mut boundaries: Vec<usize> = vec![0, line_len];
+        if !stale_syntax {
+            for s in line_syntax {
+                boundaries.push(s.range.start.min(line_len));
+                boundaries.push(s.range.end.min(line_len));
             }
-            continue;
         }
-        let mut cursor = 0usize;
-        for span in spans {
-            let start = span.range.start.min(line_len);
-            let end = span.range.end.min(line_len);
+        for (r, _) in line_finds {
+            boundaries.push(r.start.min(line_len));
+            boundaries.push(r.end.min(line_len));
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let end = window[1];
+            if start >= end {
+                continue;
+            }
             if !line.is_char_boundary(start) || !line.is_char_boundary(end) {
                 continue;
             }
-            if start > cursor {
-                job.append(&line[cursor..start], 0.0, plain.clone());
-            }
-            let r = ((span.rgb >> 16) & 0xff) as u8;
-            let g = ((span.rgb >> 8) & 0xff) as u8;
-            let b = (span.rgb & 0xff) as u8;
-            let color = if r == 0 && g == 0 && b == 0 {
+            let fg = if stale_syntax {
                 Color32::PLACEHOLDER
             } else {
-                Color32::from_rgb(r, g, b)
+                syntax_fg_at(line_syntax, start)
             };
+            let bg = find_bg_at(line_finds, start).unwrap_or(Color32::TRANSPARENT);
             let fmt = egui::TextFormat {
                 font_id: font.clone(),
-                color,
+                color: fg,
+                background: bg,
                 ..Default::default()
             };
-            if end > start {
-                job.append(&line[start..end], 0.0, fmt);
-            }
-            cursor = end;
-        }
-        if cursor < line_len {
-            job.append(&line[cursor..], 0.0, plain.clone());
+            job.append(&line[start..end], 0.0, fmt);
         }
         if has_nl {
-            job.append("\n", 0.0, plain.clone());
+            // The trailing newline always renders plain; no syntax/find
+            // colors apply across line boundaries.
+            job.append("\n", 0.0, plain_fmt(Color32::TRANSPARENT));
         }
     }
     job
@@ -2200,13 +2289,13 @@ mod tests {
 
     #[test]
     fn build_edit_layout_empty_text_yields_empty_job() {
-        let job = build_edit_layout("", &[], 13.0);
+        let job = build_edit_layout("", &[], &[], 13.0);
         assert!(job.sections.is_empty());
     }
 
     #[test]
     fn build_edit_layout_plain_text_with_no_spans_renders_each_line() {
-        let job = build_edit_layout("a\nb\nc\n", &[], 13.0);
+        let job = build_edit_layout("a\nb\nc\n", &[], &[], 13.0);
         let text: String = job
             .sections
             .iter()
@@ -2241,7 +2330,7 @@ mod tests {
                 style_bits: 0,
             }],
         ];
-        let job = build_edit_layout("ab cd\nfoo\n", &syntax, 13.0);
+        let job = build_edit_layout("ab cd\nfoo\n", &syntax, &[], 13.0);
         // Expect: red "ab", green " cd", newline, blue "foo", newline.
         let texts: Vec<&str> = job
             .sections
@@ -2265,7 +2354,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("abc\n", &syntax, 13.0);
+        let job = build_edit_layout("abc\n", &syntax, &[], 13.0);
         let texts: Vec<&str> = job
             .sections
             .iter()
@@ -2284,7 +2373,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("a\nb\nc\n", &syntax, 13.0);
+        let job = build_edit_layout("a\nb\nc\n", &syntax, &[], 13.0);
         // Line 1 is colored; lines 2 and 3 are plain.
         let texts: Vec<&str> = job
             .sections
@@ -2304,7 +2393,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("abc", &syntax, 13.0);
+        let job = build_edit_layout("abc", &syntax, &[], 13.0);
         let texts: Vec<&str> = job
             .sections
             .iter()
@@ -2505,6 +2594,6 @@ mod tests {
             style_bits: 0,
         }]];
         // Should not panic.
-        let _ = build_edit_layout("élan\n", &syntax, 13.0);
+        let _ = build_edit_layout("élan\n", &syntax, &[], 13.0);
     }
 }

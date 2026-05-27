@@ -50,6 +50,9 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # Date / time arithmetic for blame display
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Regex for "find" mode (opt-in via the .* toggle)
+regex = "1"
+
 # Native file dialogs (menubar "Open Files..." / "Open Folder...")
 rfd = "0.15"
 
