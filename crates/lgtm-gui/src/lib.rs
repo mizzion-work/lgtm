@@ -14,9 +14,11 @@ use std::path::PathBuf;
 use lgtm_core::{AlignedDiff, DiffDocument, FolderDiff, ThreeWayMerge};
 
 mod diff_app;
+mod merge_app;
 mod theme;
 
 pub use diff_app::DiffApp;
+pub use merge_app::{MergeApp, MergeExit};
 
 /// Outcome of a GUI session, mapped by the CLI to a process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +63,49 @@ pub fn run_diff(
 }
 
 /// Launch the three-way merge window. On save, the merged content is
-/// written to `output_path` and `Identical` is returned.
+/// written to `output_path` and `Identical` is returned. On abort,
+/// `Differs` is returned and `output_path` is left untouched.
 pub fn run_merge(merge: ThreeWayMerge, output_path: PathBuf) -> anyhow::Result<GuiOutcome> {
-    let _ = (merge, output_path);
-    todo!("step 8: merge window")
+    let app = MergeApp::new(merge, output_path);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("lgtm — merge")
+            .with_inner_size([1400.0, 900.0]),
+        ..Default::default()
+    };
+    let exit_box: std::sync::Arc<std::sync::Mutex<Option<MergeExit>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let exit_box_inner = exit_box.clone();
+    eframe::run_native(
+        "lgtm",
+        options,
+        Box::new(move |_cc| {
+            Ok(Box::new(MergeAppWithExit {
+                inner: app,
+                exit_out: exit_box_inner,
+            }))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe init failed: {e}"))?;
+    let exit = exit_box.lock().unwrap().unwrap_or(MergeExit::Aborted);
+    Ok(match exit {
+        MergeExit::Saved => GuiOutcome::Identical,
+        MergeExit::Aborted => GuiOutcome::Differs,
+    })
+}
+
+struct MergeAppWithExit {
+    inner: MergeApp,
+    exit_out: std::sync::Arc<std::sync::Mutex<Option<MergeExit>>>,
+}
+
+impl eframe::App for MergeAppWithExit {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.inner.update(ctx, frame);
+        if let Some(exit) = self.inner.exit {
+            *self.exit_out.lock().unwrap() = Some(exit);
+        }
+    }
 }
 
 /// Launch the folder-diff window.

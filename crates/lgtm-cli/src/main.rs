@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use lgtm_core::{unified_diff, DiffDocument};
+use lgtm_core::{unified_diff, DiffDocument, ThreeWayMerge};
 use lgtm_gui::GuiOutcome;
 
 const EXIT_IDENTICAL: u8 = 0;
@@ -160,11 +160,11 @@ fn dispatch_no_gui(left: &DiffDocument, right: &DiffDocument) -> anyhow::Result<
 }
 
 fn dispatch_merge(cli: Cli) -> anyhow::Result<u8> {
-    let right = cli
+    let base_path = cli
         .right
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--merge requires LOCAL BASE REMOTE positional args"))?;
-    let remote = cli
+    let remote_path = cli
         .remote
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--merge requires LOCAL BASE REMOTE positional args"))?;
@@ -173,9 +173,76 @@ fn dispatch_merge(cli: Cli) -> anyhow::Result<u8> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--merge requires --output"))?;
 
-    // step 8 lights this path up; for now, surface a clear error if invoked.
-    let _ = (cli.left, right, remote, output);
-    anyhow::bail!("--merge is not implemented yet (lands in step 8)")
+    let local = DiffDocument::load(&cli.left)?;
+    let base = DiffDocument::load(&base_path)?;
+    let remote = DiffDocument::load(&remote_path)?;
+    let merge = ThreeWayMerge::compute(local, base, remote)?;
+
+    // Headless mode for end-to-end git tests: bypass the GUI.
+    // LGTM_HEADLESS_MERGE=auto|take-local|take-remote|abort
+    if let Ok(mode) = std::env::var("LGTM_HEADLESS_MERGE") {
+        return dispatch_merge_headless(merge, output, &mode, cli.quiet);
+    }
+
+    let outcome = lgtm_gui::run_merge(merge, output)?;
+    match outcome {
+        GuiOutcome::Identical => {
+            emit_lgtm(cli.quiet);
+            Ok(EXIT_IDENTICAL)
+        }
+        GuiOutcome::Differs => Ok(EXIT_DIFFERS),
+    }
+}
+
+fn dispatch_merge_headless(
+    mut merge: ThreeWayMerge,
+    output: PathBuf,
+    mode: &str,
+    quiet: bool,
+) -> anyhow::Result<u8> {
+    use lgtm_core::{MergeRegion, Side};
+    match mode {
+        "abort" => Ok(EXIT_DIFFERS),
+        "auto" => {
+            // Save only if all conflicts are already auto-resolved.
+            if merge.unresolved_conflicts() > 0 {
+                return Ok(EXIT_DIFFERS);
+            }
+            let text = merge.render()?;
+            std::fs::write(&output, text)?;
+            emit_lgtm(quiet);
+            Ok(EXIT_IDENTICAL)
+        }
+        "take-local" | "take-remote" => {
+            let take = if mode == "take-local" {
+                Side::Left
+            } else {
+                Side::Right
+            };
+            for r in &mut merge.regions {
+                if let MergeRegion::Conflict {
+                    local,
+                    remote,
+                    resolution,
+                    ..
+                } = r
+                {
+                    *resolution = Some(if take == Side::Left {
+                        local.clone()
+                    } else {
+                        remote.clone()
+                    });
+                }
+            }
+            let text = merge.render()?;
+            std::fs::write(&output, text)?;
+            emit_lgtm(quiet);
+            Ok(EXIT_IDENTICAL)
+        }
+        other => anyhow::bail!(
+            "LGTM_HEADLESS_MERGE: unknown mode {other:?} (expected auto|take-local|take-remote|abort)"
+        ),
+    }
 }
 
 fn dispatch_folder(left: &Path, right: &Path) -> anyhow::Result<u8> {

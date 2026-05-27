@@ -122,3 +122,83 @@ fn merge_without_args_errors_cleanly() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
 }
+
+#[test]
+fn merge_headless_auto_resolves_non_conflicting_changes() {
+    let local = tmp("h_local.txt", b"a\nLOCAL\nc\n");
+    let base = tmp("h_base.txt", b"a\nb\nc\n");
+    let remote = tmp("h_remote.txt", b"a\nb\nc\n");
+    let merged_dir = std::env::temp_dir().join("lgtm-cli-tests");
+    std::fs::create_dir_all(&merged_dir).unwrap();
+    let merged = merged_dir.join("h_merged_auto.txt");
+    let _ = std::fs::remove_file(&merged);
+
+    let out = Command::new(bin())
+        .env("LGTM_HEADLESS_MERGE", "auto")
+        .arg("--merge")
+        .arg(&local)
+        .arg(&base)
+        .arg(&remote)
+        .arg("--output")
+        .arg(&merged)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LGTM"));
+    let body = std::fs::read_to_string(&merged).unwrap();
+    assert_eq!(body, "a\nLOCAL\nc\n");
+}
+
+#[test]
+fn merge_headless_take_local_resolves_conflict() {
+    let local = tmp("c_local.txt", b"a\nLOCAL\nc\n");
+    let base = tmp("c_base.txt", b"a\nb\nc\n");
+    let remote = tmp("c_remote.txt", b"a\nREMOTE\nc\n");
+    let merged = std::env::temp_dir()
+        .join("lgtm-cli-tests")
+        .join("c_merged.txt");
+    let _ = std::fs::remove_file(&merged);
+
+    let out = Command::new(bin())
+        .env("LGTM_HEADLESS_MERGE", "take-local")
+        .arg("--merge")
+        .arg(&local)
+        .arg(&base)
+        .arg(&remote)
+        .arg("--output")
+        .arg(&merged)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let body = std::fs::read_to_string(&merged).unwrap();
+    assert_eq!(body, "a\nLOCAL\nc\n");
+}
+
+#[test]
+fn merge_headless_abort_exits_one_and_doesnt_write_output() {
+    let local = tmp("a_local.txt", b"a\nLOCAL\nc\n");
+    let base = tmp("a_base.txt", b"a\nb\nc\n");
+    let remote = tmp("a_remote.txt", b"a\nREMOTE\nc\n");
+    let merged = std::env::temp_dir()
+        .join("lgtm-cli-tests")
+        .join("a_merged.txt");
+    let _ = std::fs::remove_file(&merged);
+
+    let out = Command::new(bin())
+        .env("LGTM_HEADLESS_MERGE", "abort")
+        .arg("--merge")
+        .arg(&local)
+        .arg(&base)
+        .arg(&remote)
+        .arg("--output")
+        .arg(&merged)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!merged.exists(), "abort must not write the output file");
+}
