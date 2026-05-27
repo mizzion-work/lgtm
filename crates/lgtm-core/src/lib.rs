@@ -37,8 +37,8 @@ pub mod settings;
 
 pub use blame::{BLAME_LINE_CAP, BlameCache, BlameInfo};
 pub use diff::{
-    AlignedDiff, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange, InlineChangeKind, Side,
-    extract_lines, splice_lines, unified_diff,
+    AlignedDiff, DiffOptions, DiffRow, DiffStats, HunkKind, HunkRange, InlineChange,
+    InlineChangeKind, Side, extract_lines, splice_lines, unified_diff,
 };
 pub use document::{DiffDocument, HARD_SIZE_LIMIT, LineEnding, SOFT_SIZE_LIMIT};
 pub use editor::{EditorLauncher, LineArgStyle, resolve_real_path};

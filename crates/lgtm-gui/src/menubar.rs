@@ -57,6 +57,10 @@ pub enum MenuAction {
     SetEditorTheme(EditorTheme),
     /// Toggle the git-graph drawer.
     ToggleGitGraph,
+    /// Toggle word-wrap (long lines reflow at pane width).
+    ToggleWordWrap,
+    /// Toggle ignore-whitespace mode in the diff computation.
+    ToggleIgnoreWhitespace,
 }
 
 /// What state the host window can do at the moment. Drives whether items
@@ -81,6 +85,10 @@ pub struct MenuContext {
     pub editor_theme: EditorTheme,
     /// `true` if the git-graph drawer is currently visible.
     pub git_graph_visible: bool,
+    /// Current word-wrap setting (for ✔ marking).
+    pub word_wrap: bool,
+    /// Current ignore-whitespace setting (for ✔ marking).
+    pub ignore_whitespace: bool,
 }
 
 impl Default for MenuContext {
@@ -95,6 +103,8 @@ impl Default for MenuContext {
             app_theme: AppTheme::Auto,
             editor_theme: EditorTheme::default(),
             git_graph_visible: false,
+            word_wrap: false,
+            ignore_whitespace: false,
         }
     }
 }
@@ -297,6 +307,25 @@ pub fn render_menubar(
                     }
                 });
                 ui.separator();
+                let wrap_label = if ctx.word_wrap {
+                    "✔ Word Wrap"
+                } else {
+                    "   Word Wrap"
+                };
+                if ui.button(wrap_label).clicked() {
+                    out.push(MenuAction::ToggleWordWrap);
+                    ui.close_menu();
+                }
+                let ws_label = if ctx.ignore_whitespace {
+                    "✔ Ignore Whitespace"
+                } else {
+                    "   Ignore Whitespace"
+                };
+                if ui.button(ws_label).clicked() {
+                    out.push(MenuAction::ToggleIgnoreWhitespace);
+                    ui.close_menu();
+                }
+                ui.separator();
                 let graph_label = if ctx.git_graph_visible {
                     "✔ Show Git Graph"
                 } else {
@@ -364,15 +393,38 @@ pub fn about_body() -> String {
 
 /// Body of the "Keyboard Shortcuts" modal.
 pub fn shortcuts_body() -> &'static str {
-    "n / p              next / previous hunk\n\
+    "FILE\n  \
+     Ctrl+O             open files…\n  \
+     Ctrl+Shift+O       open folders…\n  \
+     Ctrl+S             save modified panes\n  \
+     Ctrl+Q             quit\n  \
+     Esc                close find bar, then close window (confirms if dirty)\n\
+     \n\
+     FIND\n  \
+     Ctrl+F             open the find bar\n  \
+     Enter              next match (in find input)\n  \
+     Shift+Enter        previous match\n  \
+     Aa toggle          case-sensitive\n  \
+     .* toggle          regex mode\n\
+     \n\
+     HUNKS  (view mode only — disabled while typing)\n  \
+     n / p              next / previous hunk\n  \
      Ctrl+Home / End    first / last hunk\n\
-     e                  open hovered file in $EDITOR\n\
+     \n\
+     EDITOR INTEGRATION  (view mode only)\n  \
+     e                  open hovered file at hovered line in $EDITOR\n  \
      Shift+E            open both panes in $EDITOR\n\
-     Ctrl+S             save modified panes\n\
-     Ctrl+O             open files…\n\
-     Ctrl+Shift+O       open folders…\n\
-     Ctrl+Q             quit\n\
-     Esc                close window (confirms if dirty)\n"
+     \n\
+     FONT\n  \
+     Ctrl+=             increase\n  \
+     Ctrl+-             decrease\n  \
+     Ctrl+0             reset to default\n\
+     \n\
+     MOUSE\n  \
+     hunk → / ←         copy this hunk left→right or right→left\n  \
+     hover any line     show git blame (silent if unavailable)\n  \
+     minimap click      jump to nearest hunk\n  \
+     drag splitter      (edit mode) resize the two panes\n"
 }
 
 #[cfg(test)]

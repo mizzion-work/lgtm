@@ -269,6 +269,15 @@ pub struct AlignedDiff {
     pub stats: DiffStats,
 }
 
+/// Options controlling [`AlignedDiff::compute_with`] /
+/// [`AlignedDiff::compute_from_text_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffOptions {
+    /// Treat whitespace-only differences as equal. The displayed text
+    /// still shows the original (unstripped) line content.
+    pub ignore_whitespace: bool,
+}
+
 impl AlignedDiff {
     /// Compute the aligned diff for two documents.
     ///
@@ -290,17 +299,50 @@ impl AlignedDiff {
         Self::compute_from_text(&left.content, &right.content)
     }
 
+    /// Compute with options. Same as [`Self::compute`] when
+    /// `opts == DiffOptions::default()`.
+    pub fn compute_with(left: &DiffDocument, right: &DiffDocument, opts: DiffOptions) -> Self {
+        Self::compute_from_text_with(&left.content, &right.content, opts)
+    }
+
     /// Compute the aligned diff directly from two strings. Used by tests
     /// and by the GUI's debounced re-diff path.
     pub fn compute_from_text(left: &str, right: &str) -> Self {
+        Self::compute_from_text_with(left, right, DiffOptions::default())
+    }
+
+    /// Same as [`Self::compute_from_text`] but honors `opts`. When
+    /// `opts.ignore_whitespace` is true, lines are normalized (all
+    /// runs of whitespace collapsed to nothing) for the **equality
+    /// test only** — the rows emitted into [`AlignedDiff::rows`] still
+    /// carry the original line text so the GUI displays it verbatim.
+    pub fn compute_from_text_with(left: &str, right: &str, opts: DiffOptions) -> Self {
+        if !opts.ignore_whitespace {
+            return Self::compute_from_text_raw(left, right);
+        }
+        // Normalize for diffing but keep originals for display.
+        let left_orig: Vec<&str> = left.split_inclusive('\n').collect();
+        let right_orig: Vec<&str> = right.split_inclusive('\n').collect();
+        let left_norm: Vec<String> = left_orig.iter().map(|s| strip_ws(s)).collect();
+        let right_norm: Vec<String> = right_orig.iter().map(|s| strip_ws(s)).collect();
+        let left_norm_refs: Vec<&str> = left_norm.iter().map(String::as_str).collect();
+        let right_norm_refs: Vec<&str> = right_norm.iter().map(String::as_str).collect();
+        let diff = TextDiff::from_slices(&left_norm_refs, &right_norm_refs);
+        Self::build_from_ops(diff.ops(), &left_orig, &right_orig)
+    }
+
+    fn compute_from_text_raw(left: &str, right: &str) -> Self {
         let diff = TextDiff::from_lines(left, right);
         let left_lines = diff.old_slices();
         let right_lines = diff.new_slices();
+        Self::build_from_ops(diff.ops(), left_lines, right_lines)
+    }
 
+    fn build_from_ops(ops: &[DiffOp], left_lines: &[&str], right_lines: &[&str]) -> Self {
         let mut rows: Vec<DiffRow> = Vec::new();
         let mut stats = DiffStats::default();
 
-        for op in diff.ops() {
+        for op in ops {
             match *op {
                 DiffOp::Equal {
                     old_index,
@@ -415,6 +457,12 @@ pub fn unified_diff(
             .to_string(),
     );
     out
+}
+
+/// Strip all whitespace from a line for ignore-whitespace diffing.
+/// Used as a normalization key; the *displayed* text is the original.
+fn strip_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn compute_inline(left: &str, right: &str) -> Vec<InlineChange> {
@@ -840,5 +888,59 @@ mod tests {
         let block = extract_lines(left, lr);
         let new_right = splice_lines(right, rr, &block);
         assert_eq!(new_right, "a\nLOCAL\nc\n");
+    }
+
+    // ---- DiffOptions::ignore_whitespace ----------------------------
+
+    #[test]
+    fn ignore_whitespace_collapses_pure_whitespace_diff_into_equal() {
+        let left = "if (x)\n";
+        let right = "if   (x)\n";
+        let strict = AlignedDiff::compute_from_text(left, right);
+        assert_eq!(strict.stats.differences(), 1);
+        let lax = AlignedDiff::compute_from_text_with(
+            left,
+            right,
+            DiffOptions {
+                ignore_whitespace: true,
+            },
+        );
+        assert_eq!(lax.stats.differences(), 0);
+    }
+
+    #[test]
+    fn ignore_whitespace_still_surfaces_real_changes() {
+        let left = "if (x)\n";
+        let right = "if (y)\n";
+        let lax = AlignedDiff::compute_from_text_with(
+            left,
+            right,
+            DiffOptions {
+                ignore_whitespace: true,
+            },
+        );
+        assert_eq!(lax.stats.differences(), 1);
+    }
+
+    #[test]
+    fn ignore_whitespace_preserves_original_line_text() {
+        // The diff is computed against normalized lines but emitted
+        // rows must carry the original (un-stripped) text.
+        let left = "  foo\n";
+        let right = "foo\n";
+        let lax = AlignedDiff::compute_from_text_with(
+            left,
+            right,
+            DiffOptions {
+                ignore_whitespace: true,
+            },
+        );
+        assert_eq!(lax.stats.differences(), 0);
+        // Find the Equal row and verify the rendered text is preserved.
+        if let DiffRow::Equal { text, .. } = &lax.rows[0] {
+            assert_eq!(text, "  foo\n");
+        } else {
+            panic!("expected Equal row, got {:?}", lax.rows[0]);
+        }
     }
 }

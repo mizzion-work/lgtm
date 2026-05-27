@@ -129,6 +129,11 @@ pub struct Settings {
     pub app_theme: AppTheme,
     /// Syntect theme for syntax-highlighted code in the diff view.
     pub editor_theme: EditorTheme,
+    /// Wrap long lines at pane width instead of letting them overflow.
+    pub word_wrap: bool,
+    /// Treat whitespace-only changes as equal — affects the diff
+    /// computation, not the rendering.
+    pub ignore_whitespace: bool,
 }
 
 impl Default for Settings {
@@ -137,6 +142,8 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             app_theme: AppTheme::Auto,
             editor_theme: EditorTheme::default(),
+            word_wrap: false,
+            ignore_whitespace: false,
         }
     }
 }
@@ -178,6 +185,16 @@ impl Settings {
                         out.editor_theme = t;
                     }
                 }
+                "word_wrap" => {
+                    if let Some(b) = parse_bool(val) {
+                        out.word_wrap = b;
+                    }
+                }
+                "ignore_whitespace" => {
+                    if let Some(b) = parse_bool(val) {
+                        out.ignore_whitespace = b;
+                    }
+                }
                 _ => { /* unknown key — ignore for forward-compat */ }
             }
         }
@@ -202,10 +219,12 @@ impl Settings {
             })?;
         }
         let body = format!(
-            "font_size\t{}\napp_theme\t{}\neditor_theme\t{}\n",
+            "font_size\t{}\napp_theme\t{}\neditor_theme\t{}\nword_wrap\t{}\nignore_whitespace\t{}\n",
             self.font_size,
             self.app_theme.as_str(),
             self.editor_theme.syntect_name(),
+            self.word_wrap,
+            self.ignore_whitespace,
         );
         std::fs::write(path, body).map_err(|source| crate::error::Error::Io {
             path: path.to_path_buf(),
@@ -232,6 +251,14 @@ impl Settings {
 
 fn clamp_font(v: f32) -> f32 {
     v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -291,10 +318,14 @@ mod tests {
             font_size: 17.0,
             app_theme: AppTheme::Light,
             editor_theme: EditorTheme::SolarizedLight,
+            word_wrap: true,
+            ignore_whitespace: true,
         };
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.font_size, 17.0);
+        assert!(loaded.word_wrap);
+        assert!(loaded.ignore_whitespace);
         assert_eq!(loaded.app_theme, AppTheme::Light);
         assert_eq!(loaded.editor_theme, EditorTheme::SolarizedLight);
     }

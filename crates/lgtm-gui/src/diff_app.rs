@@ -237,7 +237,14 @@ impl DiffApp {
         self.current_hunk = 0;
         self.hover_focus = None;
         self.blame_cache = BlameCache::new();
-        self.diff = AlignedDiff::compute(&self.left, &self.right).with_inline();
+        self.diff = AlignedDiff::compute_with(
+            &self.left,
+            &self.right,
+            lgtm_core::DiffOptions {
+                ignore_whitespace: self.settings.ignore_whitespace,
+            },
+        )
+        .with_inline();
         self.refresh_highlights();
         self.recompute_find();
         // Record into the recent list and persist.
@@ -310,6 +317,16 @@ impl DiffApp {
                 if self.git_graph_visible && self.git_graph.is_none() {
                     self.git_graph = Some(self.load_git_graph());
                 }
+            }
+            MenuAction::ToggleWordWrap => {
+                self.settings.word_wrap = !self.settings.word_wrap;
+                let _ = self.settings.save();
+            }
+            MenuAction::ToggleIgnoreWhitespace => {
+                self.settings.ignore_whitespace = !self.settings.ignore_whitespace;
+                let _ = self.settings.save();
+                // Re-run the diff: ignore_whitespace changes the result.
+                self.recompute_diff();
             }
         }
     }
@@ -509,7 +526,14 @@ impl DiffApp {
     /// Recompute the diff from current pane contents. Cheap enough that we
     /// just call it once the debounce window expires.
     pub fn recompute_diff(&mut self) {
-        self.diff = AlignedDiff::compute(&self.left, &self.right).with_inline();
+        self.diff = AlignedDiff::compute_with(
+            &self.left,
+            &self.right,
+            lgtm_core::DiffOptions {
+                ignore_whitespace: self.settings.ignore_whitespace,
+            },
+        )
+        .with_inline();
         if self.current_hunk >= self.diff.hunks.len() {
             self.current_hunk = self.diff.hunks.len().saturating_sub(1);
         }
@@ -831,9 +855,12 @@ impl DiffApp {
             let left_content = &mut self.left.content;
             let left_syntax = &self.cached_left_syntax;
             let left_finds_ref = &left_finds_per_line;
+            let word_wrap = self.settings.word_wrap;
             let mut left_layouter =
-                move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let job = build_edit_layout(text, left_syntax, left_finds_ref, font_size);
+                move |ui: &egui::Ui, text: &str, wrap: f32| -> std::sync::Arc<egui::Galley> {
+                    let max_w = if word_wrap { wrap } else { f32::INFINITY };
+                    let job =
+                        build_edit_layout(text, left_syntax, left_finds_ref, font_size, max_w);
                     ui.fonts(|f| f.layout_job(job))
                 };
             ui.allocate_ui_with_layout(
@@ -884,9 +911,12 @@ impl DiffApp {
             let right_content = &mut self.right.content;
             let right_syntax = &self.cached_right_syntax;
             let right_finds_ref = &right_finds_per_line;
+            let word_wrap_r = self.settings.word_wrap;
             let mut right_layouter =
-                move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let job = build_edit_layout(text, right_syntax, right_finds_ref, font_size);
+                move |ui: &egui::Ui, text: &str, wrap: f32| -> std::sync::Arc<egui::Galley> {
+                    let max_w = if word_wrap_r { wrap } else { f32::INFINITY };
+                    let job =
+                        build_edit_layout(text, right_syntax, right_finds_ref, font_size, max_w);
                     ui.fonts(|f| f.layout_job(job))
                 };
             ui.allocate_ui_with_layout(
@@ -1199,6 +1229,8 @@ impl eframe::App for DiffApp {
                 app_theme: self.settings.app_theme,
                 editor_theme: self.settings.editor_theme,
                 git_graph_visible: self.git_graph_visible,
+                word_wrap: self.settings.word_wrap,
+                ignore_whitespace: self.settings.ignore_whitespace,
             };
             crate::menubar::render_menubar(ui, mctx, &self.recents, &mut actions);
         });
@@ -1665,6 +1697,7 @@ fn build_edit_layout(
     syntax: &[Vec<StyledSpan>],
     find_ranges: &[Vec<(std::ops::Range<usize>, bool)>],
     font_size: f32,
+    wrap_width: f32,
 ) -> egui::text::LayoutJob {
     let font = FontId::monospace(font_size);
     let plain_fmt = |bg: Color32| egui::TextFormat {
@@ -1674,6 +1707,7 @@ fn build_edit_layout(
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
     for (line_idx, line_with_nl) in text.split_inclusive('\n').enumerate() {
         let has_nl = line_with_nl.ends_with('\n');
         let line = if has_nl {
@@ -2299,13 +2333,13 @@ mod tests {
 
     #[test]
     fn build_edit_layout_empty_text_yields_empty_job() {
-        let job = build_edit_layout("", &[], &[], 13.0);
+        let job = build_edit_layout("", &[], &[], 13.0, f32::INFINITY);
         assert!(job.sections.is_empty());
     }
 
     #[test]
     fn build_edit_layout_plain_text_with_no_spans_renders_each_line() {
-        let job = build_edit_layout("a\nb\nc\n", &[], &[], 13.0);
+        let job = build_edit_layout("a\nb\nc\n", &[], &[], 13.0, f32::INFINITY);
         let text: String = job
             .sections
             .iter()
@@ -2340,7 +2374,7 @@ mod tests {
                 style_bits: 0,
             }],
         ];
-        let job = build_edit_layout("ab cd\nfoo\n", &syntax, &[], 13.0);
+        let job = build_edit_layout("ab cd\nfoo\n", &syntax, &[], 13.0, f32::INFINITY);
         // Expect: red "ab", green " cd", newline, blue "foo", newline.
         let texts: Vec<&str> = job
             .sections
@@ -2364,7 +2398,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("abc\n", &syntax, &[], 13.0);
+        let job = build_edit_layout("abc\n", &syntax, &[], 13.0, f32::INFINITY);
         let texts: Vec<&str> = job
             .sections
             .iter()
@@ -2383,7 +2417,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("a\nb\nc\n", &syntax, &[], 13.0);
+        let job = build_edit_layout("a\nb\nc\n", &syntax, &[], 13.0, f32::INFINITY);
         // Line 1 is colored; lines 2 and 3 are plain.
         let texts: Vec<&str> = job
             .sections
@@ -2403,7 +2437,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("abc", &syntax, &[], 13.0);
+        let job = build_edit_layout("abc", &syntax, &[], 13.0, f32::INFINITY);
         let texts: Vec<&str> = job
             .sections
             .iter()
@@ -2604,6 +2638,6 @@ mod tests {
             style_bits: 0,
         }]];
         // Should not panic.
-        let _ = build_edit_layout("élan\n", &syntax, &[], 13.0);
+        let _ = build_edit_layout("élan\n", &syntax, &[], 13.0, f32::INFINITY);
     }
 }
