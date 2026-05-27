@@ -1,7 +1,7 @@
 //! Two-file diff window.
 
-use egui::{Align, Color32, FontId, Layout, RichText, ScrollArea, Sense, TextStyle};
-use lgtm_core::{AlignedDiff, DiffDocument, DiffRow, InlineChangeKind, Side};
+use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
+use lgtm_core::{AlignedDiff, DiffDocument, DiffRow, HunkKind, InlineChangeKind, Side};
 
 use crate::theme;
 
@@ -19,6 +19,8 @@ pub struct DiffApp {
     pub current_hunk: usize,
     /// Set when the user presses `Esc` or closes the window.
     pub close_requested: bool,
+    /// Request a scroll-to-row on the next frame.
+    pending_scroll: Option<usize>,
 }
 
 impl DiffApp {
@@ -36,7 +38,38 @@ impl DiffApp {
             read_only,
             current_hunk: 0,
             close_requested: false,
+            pending_scroll: None,
         }
+    }
+
+    /// Move the current hunk by `delta`, wrapping at the ends.
+    pub fn jump_hunk(&mut self, delta: isize) {
+        let n = self.diff.hunks.len();
+        if n == 0 {
+            return;
+        }
+        let new = (self.current_hunk as isize + delta).rem_euclid(n as isize) as usize;
+        self.current_hunk = new;
+        self.pending_scroll = Some(self.diff.hunks[new].start_row);
+    }
+
+    /// Jump to the first hunk.
+    pub fn jump_first(&mut self) {
+        if self.diff.hunks.is_empty() {
+            return;
+        }
+        self.current_hunk = 0;
+        self.pending_scroll = Some(self.diff.hunks[0].start_row);
+    }
+
+    /// Jump to the last hunk.
+    pub fn jump_last(&mut self) {
+        if self.diff.hunks.is_empty() {
+            return;
+        }
+        let i = self.diff.hunks.len() - 1;
+        self.current_hunk = i;
+        self.pending_scroll = Some(self.diff.hunks[i].start_row);
     }
 
     fn title(&self) -> String {
@@ -78,7 +111,7 @@ impl DiffApp {
         });
     }
 
-    fn render_diff(&self, ui: &mut egui::Ui) {
+    fn render_diff(&mut self, ui: &mut egui::Ui) {
         if self.left.is_binary || self.right.is_binary {
             render_binary_stub(ui, &self.left, &self.right);
             return;
@@ -86,27 +119,100 @@ impl DiffApp {
 
         let row_height = ui.text_style_height(&TextStyle::Monospace) + 2.0;
         let total = self.diff.rows.len();
+        let pending = self.pending_scroll.take();
 
-        // A single ScrollArea hosting both columns gives free, perfect
-        // synchronized scrolling: there is exactly one scroll source.
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, total, |ui, row_range| {
-                ui.style_mut().override_font_id = Some(FontId::monospace(13.0));
-                for idx in row_range {
-                    render_row(ui, &self.diff.rows[idx], row_height);
+        let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(row) = pending {
+            // Place the target row a third of the way down the viewport.
+            scroll = scroll.vertical_scroll_offset((row as f32 * row_height) - 60.0);
+        }
+        scroll.show_rows(ui, row_height, total, |ui, row_range| {
+            ui.style_mut().override_font_id = Some(FontId::monospace(13.0));
+            for idx in row_range {
+                render_row(ui, &self.diff.rows[idx], row_height);
+            }
+        });
+    }
+
+    fn render_minimap(&mut self, ui: &mut egui::Ui) {
+        let total = self.diff.rows.len().max(1) as f32;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ui.available_height()),
+            Sense::click(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, Color32::from_gray(0x14));
+        for (i, hunk) in self.diff.hunks.iter().enumerate() {
+            let y0 = rect.top() + (hunk.start_row as f32 / total) * rect.height();
+            let y1 = rect.top() + (hunk.end_row as f32 / total) * rect.height();
+            let h = (y1 - y0).max(2.0);
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 2.0, y0),
+                egui::vec2(rect.width() - 4.0, h),
+            );
+            let color = match hunk.kind {
+                HunkKind::Insert => theme::INSERT_BG,
+                HunkKind::Delete => theme::DELETE_BG,
+                HunkKind::Replace => theme::REPLACE_BG,
+            };
+            painter.rect_filled(bar, 0.0, color);
+            if i == self.current_hunk {
+                painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.5, Color32::WHITE));
+            }
+        }
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let frac = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                let target_row = (frac * total) as usize;
+                // pick the nearest hunk to that row
+                if let Some((idx, h)) = self
+                    .diff
+                    .hunks
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, h)| h.start_row.abs_diff(target_row))
+                {
+                    self.current_hunk = idx;
+                    self.pending_scroll = Some(h.start_row);
                 }
-            });
+            }
+        }
     }
 }
 
 impl eframe::App for DiffApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keyboard shortcuts.
+        let mut delta: isize = 0;
+        let mut first = false;
+        let mut last = false;
         ctx.input(|i| {
-            if i.key_pressed(egui::Key::Escape) {
+            if i.key_pressed(Key::Escape) || i.key_pressed(Key::Q) {
                 self.close_requested = true;
             }
+            if i.key_pressed(Key::N) {
+                delta = 1;
+            }
+            if i.key_pressed(Key::P) {
+                delta = -1;
+            }
+            if i.modifiers.ctrl && i.key_pressed(Key::Home) {
+                first = true;
+            }
+            if i.modifiers.ctrl && i.key_pressed(Key::End) {
+                last = true;
+            }
         });
+        if delta != 0 {
+            self.jump_hunk(delta);
+        }
+        if first {
+            self.jump_first();
+        }
+        if last {
+            self.jump_last();
+        }
+
         if self.close_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -117,6 +223,12 @@ impl eframe::App for DiffApp {
         egui::TopBottomPanel::bottom("lgtm-status").show(ctx, |ui| {
             self.render_status(ui);
         });
+        egui::SidePanel::right("lgtm-minimap")
+            .exact_width(20.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                self.render_minimap(ui);
+            });
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_diff(ui);
         });
@@ -369,5 +481,52 @@ mod tests {
             short_path(std::path::Path::new("/tmp/x/y/foo.txt")),
             "foo.txt"
         );
+    }
+
+    fn fixture(left: &str, right: &str) -> DiffApp {
+        let l = DiffDocument::empty_for("l");
+        let mut l = l;
+        l.content = left.into();
+        let mut r = DiffDocument::empty_for("r");
+        r.content = right.into();
+        let diff = lgtm_core::AlignedDiff::compute(&l, &r);
+        DiffApp::new(l, r, diff, false)
+    }
+
+    #[test]
+    fn jump_hunk_wraps_at_ends() {
+        let mut app = fixture("a\nb\nc\nd\n", "X\nb\nY\nd\n");
+        assert_eq!(app.diff.hunks.len(), 2);
+        assert_eq!(app.current_hunk, 0);
+        app.jump_hunk(1);
+        assert_eq!(app.current_hunk, 1);
+        app.jump_hunk(1);
+        assert_eq!(app.current_hunk, 0, "wrap to first");
+        app.jump_hunk(-1);
+        assert_eq!(app.current_hunk, 1, "wrap to last when going back from 0");
+    }
+
+    #[test]
+    fn jump_hunk_noop_on_empty() {
+        let mut app = fixture("a\n", "a\n");
+        assert_eq!(app.diff.hunks.len(), 0);
+        app.jump_hunk(1);
+        assert_eq!(app.current_hunk, 0);
+        app.jump_first();
+        app.jump_last();
+        // shouldn't crash, no pending scroll
+        assert!(app.pending_scroll.is_none());
+    }
+
+    #[test]
+    fn jump_first_and_last_set_pending_scroll() {
+        let mut app = fixture("a\nb\nc\nd\n", "X\nb\nY\nd\n");
+        app.jump_last();
+        assert_eq!(app.current_hunk, 1);
+        assert!(app.pending_scroll.is_some());
+        app.pending_scroll = None;
+        app.jump_first();
+        assert_eq!(app.current_hunk, 0);
+        assert!(app.pending_scroll.is_some());
     }
 }
