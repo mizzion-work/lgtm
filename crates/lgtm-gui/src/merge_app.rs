@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea};
-use lgtm_core::{MergeRegion, Side, ThreeWayMerge};
+use lgtm_core::{MergeRegion, RecentEntry, RecentList, RecentMode, Settings, Side, ThreeWayMerge};
+
+use crate::menubar::{self, MenuAction, MenuContext};
 
 /// Reason the merge window closed; the CLI translates this to an exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +27,14 @@ pub struct MergeApp {
     show_confirm_unresolved: bool,
     show_confirm_abort: bool,
     save_error: Option<String>,
+    /// User preferences (font, theme); shared store with other windows.
+    pub settings: Settings,
+    /// Recent-files list (read-only here — merge windows don't push).
+    pub recents: RecentList,
+    /// About modal visibility.
+    show_about: bool,
+    /// Shortcuts modal visibility.
+    show_shortcuts: bool,
 }
 
 impl MergeApp {
@@ -37,6 +47,50 @@ impl MergeApp {
             show_confirm_unresolved: false,
             show_confirm_abort: false,
             save_error: None,
+            settings: Settings::load(),
+            recents: RecentList::load(),
+            show_about: false,
+            show_shortcuts: false,
+        }
+    }
+
+    fn handle_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::Save => self.try_save(),
+            MenuAction::Quit => self.show_confirm_abort = true,
+            MenuAction::ShowAbout => self.show_about = true,
+            MenuAction::ShowShortcuts => self.show_shortcuts = true,
+            MenuAction::IncreaseFontSize => {
+                self.settings.increase_font();
+                let _ = self.settings.save();
+            }
+            MenuAction::DecreaseFontSize => {
+                self.settings.decrease_font();
+                let _ = self.settings.save();
+            }
+            MenuAction::ResetFontSize => {
+                self.settings.reset_font();
+                let _ = self.settings.save();
+            }
+            MenuAction::SetAppTheme(t) => {
+                self.settings.app_theme = t;
+                let _ = self.settings.save();
+            }
+            MenuAction::SetEditorTheme(t) => {
+                self.settings.editor_theme = t;
+                let _ = self.settings.save();
+            }
+            MenuAction::OpenFiles => spawn_lgtm_files(),
+            MenuAction::OpenFolders => spawn_lgtm_folders(),
+            MenuAction::OpenRecent(entry) => spawn_from_entry(&entry),
+            MenuAction::ClearRecent => {
+                self.recents.clear();
+                let _ = self.recents.save();
+            }
+            // Edit / hunk-nav / editor / view-toggles / git-graph are
+            // not applicable in merge mode — supports flags suppress the
+            // menu items so users shouldn't see them. Ignore if fired.
+            _ => {}
         }
     }
 
@@ -68,6 +122,8 @@ impl MergeApp {
 
 impl eframe::App for MergeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::diff_app::apply_app_theme(ctx, self.settings.app_theme);
+
         let mut want_save = false;
         let mut want_quit = false;
         ctx.input(|i| {
@@ -88,6 +144,28 @@ impl eframe::App for MergeApp {
         if let Some(exit) = self.exit {
             tracing::info!("merge exit: {exit:?}");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Menubar (File / Help — Edit/View suppressed via supports flags).
+        let mut actions: Vec<MenuAction> = Vec::new();
+        egui::TopBottomPanel::top("lgtm-merge-menubar").show(ctx, |ui| {
+            let mctx = MenuContext {
+                dirty: self.merge.unresolved_conflicts() == 0,
+                supports_edit_mode: false,
+                in_edit_mode: false,
+                supports_hunk_nav: false,
+                supports_editor: false,
+                read_only: false,
+                app_theme: self.settings.app_theme,
+                editor_theme: self.settings.editor_theme,
+                git_graph_visible: false,
+                word_wrap: self.settings.word_wrap,
+                ignore_whitespace: self.settings.ignore_whitespace,
+            };
+            menubar::render_menubar(ui, mctx, &self.recents, &mut actions);
+        });
+        for action in actions {
+            self.handle_menu_action(action);
         }
 
         egui::TopBottomPanel::top("lgtm-merge-title").show(ctx, |ui| {
@@ -125,7 +203,100 @@ impl eframe::App for MergeApp {
         if self.save_error.is_some() {
             self.render_save_error(ctx);
         }
+        if self.show_about {
+            let mut open = true;
+            egui::Window::new("About lgtm")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(menubar::about_body()).monospace());
+                    if ui.button("OK").clicked() {
+                        self.show_about = false;
+                    }
+                });
+            if !open {
+                self.show_about = false;
+            }
+        }
+        if self.show_shortcuts {
+            let mut open = true;
+            egui::Window::new("Keyboard Shortcuts")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(menubar::shortcuts_body()).monospace());
+                    if ui.button("OK").clicked() {
+                        self.show_shortcuts = false;
+                    }
+                });
+            if !open {
+                self.show_shortcuts = false;
+            }
+        }
     }
+}
+
+/// Spawn a new file-mode `lgtm` window via the current binary so the
+/// user can pick fresh files without quitting the merge.
+fn spawn_lgtm_files() {
+    let Ok(me) = std::env::current_exe() else {
+        return;
+    };
+    let left = match rfd::FileDialog::new()
+        .set_title("lgtm — pick LEFT file")
+        .pick_file()
+    {
+        Some(p) => p,
+        None => return,
+    };
+    let right = match rfd::FileDialog::new()
+        .set_title("lgtm — pick RIGHT file")
+        .pick_file()
+    {
+        Some(p) => p,
+        None => return,
+    };
+    let _ = std::process::Command::new(me).arg(left).arg(right).spawn();
+}
+
+fn spawn_lgtm_folders() {
+    let Ok(me) = std::env::current_exe() else {
+        return;
+    };
+    let left = match rfd::FileDialog::new()
+        .set_title("lgtm — pick LEFT folder")
+        .pick_folder()
+    {
+        Some(p) => p,
+        None => return,
+    };
+    let right = match rfd::FileDialog::new()
+        .set_title("lgtm — pick RIGHT folder")
+        .pick_folder()
+    {
+        Some(p) => p,
+        None => return,
+    };
+    let _ = std::process::Command::new(me)
+        .arg("--dir")
+        .arg(left)
+        .arg(right)
+        .spawn();
+}
+
+fn spawn_from_entry(entry: &RecentEntry) {
+    let Ok(me) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(me);
+    if entry.mode == RecentMode::Folder {
+        cmd.arg("--dir");
+    }
+    let _ = cmd.arg(&entry.left).arg(&entry.right).spawn();
 }
 
 impl MergeApp {
