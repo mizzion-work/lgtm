@@ -49,10 +49,11 @@ impl FolderApp {
     /// Apply current filters to the entries.
     pub fn visible_entries(&self) -> impl Iterator<Item = &lgtm_core::FolderEntry> {
         let f = self.filters;
-        self.diff.entries.iter().filter(move |e| {
-            !(f.hide_identical && e.status == FolderEntryStatus::Identical)
-                && !(f.hide_left_only && e.status == FolderEntryStatus::LeftOnly)
-                && !(f.hide_right_only && e.status == FolderEntryStatus::RightOnly)
+        self.diff.entries.iter().filter(move |e| match e.status {
+            FolderEntryStatus::Identical => !f.hide_identical,
+            FolderEntryStatus::LeftOnly => !f.hide_left_only,
+            FolderEntryStatus::RightOnly => !f.hide_right_only,
+            _ => true,
         })
     }
 }
