@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextStyle};
+use egui::{Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense};
 use lgtm_core::{
     AlignedDiff, BlameCache, BlameInfo, DiffDocument, DiffRow, EditorLauncher, Highlighter,
-    HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Side, StyledSpan,
+    HunkKind, InlineChangeKind, RecentEntry, RecentList, RecentMode, Settings, Side, StyledSpan,
     SyntectHighlighter, extract_lines, resolve_real_path, splice_lines,
 };
 
@@ -99,6 +99,12 @@ pub struct DiffApp {
     editor_status: Option<String>,
     /// In-memory mirror of the on-disk recent-files list.
     recents: RecentList,
+    /// User preferences (font size, etc.). Persisted on change.
+    pub settings: Settings,
+    /// Shared scroll offset for the two edit-mode TextEdits so they
+    /// scroll together. Updated every frame from whichever pane the user
+    /// scrolled.
+    edit_scroll_y: f32,
     /// "About" modal visibility.
     show_about: bool,
     /// "Keyboard Shortcuts" modal visibility.
@@ -168,6 +174,8 @@ impl DiffApp {
             hover_focus: None,
             editor_status: None,
             recents: RecentList::load(),
+            settings: Settings::load(),
+            edit_scroll_y: 0.0,
             show_about: false,
             show_shortcuts: false,
             pending_open: None,
@@ -253,6 +261,18 @@ impl DiffApp {
             MenuAction::LastHunk => self.jump_last(),
             MenuAction::ShowShortcuts => self.show_shortcuts = true,
             MenuAction::ShowAbout => self.show_about = true,
+            MenuAction::IncreaseFontSize => {
+                self.settings.increase_font();
+                let _ = self.settings.save();
+            }
+            MenuAction::DecreaseFontSize => {
+                self.settings.decrease_font();
+                let _ = self.settings.save();
+            }
+            MenuAction::ResetFontSize => {
+                self.settings.reset_font();
+                let _ = self.settings.save();
+            }
         }
     }
 
@@ -590,6 +610,16 @@ impl DiffApp {
         let avail = ui.available_size();
         let half = (avail.x - 8.0) * 0.5;
         let read_only = self.read_only;
+        let font_size = self.settings.font_size;
+        // Shared scroll offset across both panes for synchronized scrolling.
+        // We seed both ScrollAreas with `self.edit_scroll_y`, render them,
+        // then read whichever has changed and write the new value back —
+        // whichever pane the user scrolled this frame "wins" and the
+        // other pane catches up next frame.
+        let initial_scroll = self.edit_scroll_y;
+        let mut new_scroll = initial_scroll;
+        let mut left_edited = false;
+        let mut right_edited = false;
         ui.horizontal_top(|ui| {
             // Disjoint borrows: each pane gets its content + its cached
             // syntax spans. The layouter borrows the spans immutably;
@@ -598,18 +628,18 @@ impl DiffApp {
             let left_syntax = &self.cached_left_syntax;
             let mut left_layouter =
                 move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let job = build_edit_layout(text, left_syntax);
+                    let job = build_edit_layout(text, left_syntax, font_size);
                     ui.fonts(|f| f.layout_job(job))
                 };
-            let mut left_edited = false;
             ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
-                ScrollArea::vertical()
+                let out = ScrollArea::vertical()
                     .id_salt("lgtm-edit-left")
                     .auto_shrink([false, false])
+                    .vertical_scroll_offset(initial_scroll)
                     .show(ui, |ui| {
                         let resp = ui.add(
                             egui::TextEdit::multiline(left_content)
-                                .font(FontId::monospace(13.0))
+                                .font(FontId::monospace(font_size))
                                 .code_editor()
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(40)
@@ -620,24 +650,27 @@ impl DiffApp {
                             left_edited = true;
                         }
                     });
+                if (out.state.offset.y - initial_scroll).abs() > 0.5 {
+                    new_scroll = out.state.offset.y;
+                }
             });
             ui.separator();
             let right_content = &mut self.right.content;
             let right_syntax = &self.cached_right_syntax;
             let mut right_layouter =
                 move |ui: &egui::Ui, text: &str, _wrap: f32| -> std::sync::Arc<egui::Galley> {
-                    let job = build_edit_layout(text, right_syntax);
+                    let job = build_edit_layout(text, right_syntax, font_size);
                     ui.fonts(|f| f.layout_job(job))
                 };
-            let mut right_edited = false;
             ui.allocate_ui(egui::vec2(half, avail.y), |ui| {
-                ScrollArea::vertical()
+                let out = ScrollArea::vertical()
                     .id_salt("lgtm-edit-right")
                     .auto_shrink([false, false])
+                    .vertical_scroll_offset(new_scroll)
                     .show(ui, |ui| {
                         let resp = ui.add(
                             egui::TextEdit::multiline(right_content)
-                                .font(FontId::monospace(13.0))
+                                .font(FontId::monospace(font_size))
                                 .code_editor()
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(40)
@@ -648,14 +681,18 @@ impl DiffApp {
                             right_edited = true;
                         }
                     });
+                if (out.state.offset.y - new_scroll).abs() > 0.5 {
+                    new_scroll = out.state.offset.y;
+                }
             });
-            if left_edited {
-                self.mark_edited(Side::Left);
-            }
-            if right_edited {
-                self.mark_edited(Side::Right);
-            }
         });
+        self.edit_scroll_y = new_scroll;
+        if left_edited {
+            self.mark_edited(Side::Left);
+        }
+        if right_edited {
+            self.mark_edited(Side::Right);
+        }
     }
 
     fn render_diff(&mut self, ui: &mut egui::Ui) {
@@ -668,7 +705,8 @@ impl DiffApp {
             return;
         }
 
-        let row_height = ui.text_style_height(&TextStyle::Monospace) + 2.0;
+        let font_size = self.settings.font_size;
+        let row_height = font_size + 4.0;
         let total = self.diff.rows.len();
         let pending = self.pending_scroll.take();
 
@@ -701,7 +739,7 @@ impl DiffApp {
         let mut pending_copy: Option<(usize, CopyDirection)> = None;
 
         scroll.show_rows(ui, row_height, total, |ui, row_range| {
-            ui.style_mut().override_font_id = Some(FontId::monospace(13.0));
+            ui.style_mut().override_font_id = Some(FontId::monospace(font_size));
             for idx in row_range {
                 let row = &diff.rows[idx];
                 let hunk_idx = hunk_at_row_start.get(idx).copied().flatten();
@@ -719,6 +757,7 @@ impl DiffApp {
                     hunk_idx,
                     read_only,
                     &mut pending_copy,
+                    font_size,
                 );
             }
         });
@@ -798,6 +837,18 @@ impl eframe::App for DiffApp {
             }
             if i.modifiers.command_only() && i.key_pressed(Key::Q) {
                 self.close_requested = true;
+            }
+            if i.modifiers.command_only() && i.key_pressed(Key::Equals) {
+                self.settings.increase_font();
+                let _ = self.settings.save();
+            }
+            if i.modifiers.command_only() && i.key_pressed(Key::Minus) {
+                self.settings.decrease_font();
+                let _ = self.settings.save();
+            }
+            if i.modifiers.command_only() && i.key_pressed(Key::Num0) {
+                self.settings.reset_font();
+                let _ = self.settings.save();
             }
             if i.key_pressed(Key::Escape) {
                 self.close_requested = true;
@@ -1086,6 +1137,7 @@ fn render_row_with_blame(
     hunk_idx: Option<usize>,
     read_only: bool,
     pending_copy: &mut Option<(usize, CopyDirection)>,
+    font_size: f32,
 ) {
     let bg = row_background(row);
     let avail = ui.available_width();
@@ -1120,6 +1172,7 @@ fn render_row_with_blame(
         Side::Left,
         &parts.inline_left,
         left_spans,
+        font_size,
     );
     render_center_column(&mut child, row_height, hunk_idx, read_only, pending_copy);
     let right_resp = render_pane(
@@ -1130,6 +1183,7 @@ fn render_row_with_blame(
         Side::Right,
         &parts.inline_right,
         right_spans,
+        font_size,
     );
 
     // Blame on hover. Replace rows are "modified (no blame)" by design —
@@ -1191,6 +1245,7 @@ struct RowParts<'a> {
     inline_right: InlineSpans,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pane(
     ui: &mut egui::Ui,
     width: f32,
@@ -1199,6 +1254,7 @@ fn render_pane(
     side: Side,
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
     syntax: &[StyledSpan],
+    font_size: f32,
 ) -> egui::Response {
     let resp = ui.scope(|ui| {
         ui.set_max_width(width);
@@ -1207,8 +1263,12 @@ fn render_pane(
                 Some(n) => format!("{n:>width$}", width = theme::GUTTER_WIDTH_CHARS),
                 None => " ".repeat(theme::GUTTER_WIDTH_CHARS),
             };
-            ui.label(RichText::new(gutter).color(theme::GUTTER_FG).monospace());
-            let layout = build_layout(strip_nl(text), syntax, inline, side);
+            ui.label(
+                RichText::new(gutter)
+                    .color(theme::GUTTER_FG)
+                    .font(FontId::monospace(font_size)),
+            );
+            let layout = build_layout(strip_nl(text), syntax, inline, side, font_size);
             ui.label(layout);
         });
     });
@@ -1279,8 +1339,12 @@ fn render_center_column(
 /// whose cached spans no longer fit (the user just typed there and the
 /// debounced re-highlight hasn't fired yet) or for which we have no
 /// cache entry at all (a line that was just added).
-fn build_edit_layout(text: &str, syntax: &[Vec<StyledSpan>]) -> egui::text::LayoutJob {
-    let font = FontId::monospace(13.0);
+fn build_edit_layout(
+    text: &str,
+    syntax: &[Vec<StyledSpan>],
+    font_size: f32,
+) -> egui::text::LayoutJob {
+    let font = FontId::monospace(font_size);
     let plain = egui::TextFormat {
         font_id: font.clone(),
         // PLACEHOLDER tells egui "use the surrounding text color" — i.e.
@@ -1355,8 +1419,9 @@ fn build_layout(
     syntax: &[StyledSpan],
     inline: &[(std::ops::Range<usize>, InlineChangeKind)],
     side: Side,
+    font_size: f32,
 ) -> egui::text::LayoutJob {
-    let font = FontId::monospace(13.0);
+    let font = FontId::monospace(font_size);
     let mut job = egui::text::LayoutJob::default();
     if display.is_empty() {
         return job;
@@ -1668,7 +1733,7 @@ mod tests {
 
     #[test]
     fn build_layout_handles_empty_text() {
-        let job = build_layout("", &[], &[], Side::Left);
+        let job = build_layout("", &[], &[], Side::Left, 13.0);
         assert!(job.sections.is_empty());
     }
 
@@ -1686,7 +1751,7 @@ mod tests {
                 style_bits: 0,
             },
         ];
-        let job = build_layout("abcde", &spans, &[], Side::Left);
+        let job = build_layout("abcde", &spans, &[], Side::Left, 13.0);
         // expect two non-empty sections, one per span.
         assert_eq!(job.sections.len(), 2);
         let s0 = &job.text[job.sections[0].byte_range.clone()];
@@ -1703,7 +1768,7 @@ mod tests {
             style_bits: 0,
         }];
         let inline = vec![(2..4, InlineChangeKind::Insert)];
-        let job = build_layout("abcde", &syntax, &inline, Side::Right);
+        let job = build_layout("abcde", &syntax, &inline, Side::Right, 13.0);
         // boundaries: 0, 2, 4, 5 => 3 sections: "ab", "cd", "e"
         assert_eq!(job.sections.len(), 3);
         let texts: Vec<&str> = job
@@ -1722,7 +1787,7 @@ mod tests {
     fn build_layout_drops_inline_background_on_wrong_side() {
         let inline = vec![(0..3, InlineChangeKind::Insert)];
         // Insert kind on the Left side: should NOT highlight.
-        let job = build_layout("abcdef", &[], &inline, Side::Left);
+        let job = build_layout("abcdef", &[], &inline, Side::Left, 13.0);
         assert!(
             job.sections
                 .iter()
@@ -1747,7 +1812,7 @@ mod tests {
             },
         ];
         // Should not panic even though boundary 2 splits "é".
-        let _ = build_layout("héllo", &spans, &[], Side::Left);
+        let _ = build_layout("héllo", &spans, &[], Side::Left, 13.0);
     }
 
     #[test]
@@ -1871,13 +1936,13 @@ mod tests {
 
     #[test]
     fn build_edit_layout_empty_text_yields_empty_job() {
-        let job = build_edit_layout("", &[]);
+        let job = build_edit_layout("", &[], 13.0);
         assert!(job.sections.is_empty());
     }
 
     #[test]
     fn build_edit_layout_plain_text_with_no_spans_renders_each_line() {
-        let job = build_edit_layout("a\nb\nc\n", &[]);
+        let job = build_edit_layout("a\nb\nc\n", &[], 13.0);
         let text: String = job
             .sections
             .iter()
@@ -1912,7 +1977,7 @@ mod tests {
                 style_bits: 0,
             }],
         ];
-        let job = build_edit_layout("ab cd\nfoo\n", &syntax);
+        let job = build_edit_layout("ab cd\nfoo\n", &syntax, 13.0);
         // Expect: red "ab", green " cd", newline, blue "foo", newline.
         let texts: Vec<&str> = job
             .sections
@@ -1936,7 +2001,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("abc\n", &syntax);
+        let job = build_edit_layout("abc\n", &syntax, 13.0);
         let texts: Vec<&str> = job
             .sections
             .iter()
@@ -1955,7 +2020,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("a\nb\nc\n", &syntax);
+        let job = build_edit_layout("a\nb\nc\n", &syntax, 13.0);
         // Line 1 is colored; lines 2 and 3 are plain.
         let texts: Vec<&str> = job
             .sections
@@ -1975,7 +2040,7 @@ mod tests {
             rgb: 0xff_00_00,
             style_bits: 0,
         }]];
-        let job = build_edit_layout("abc", &syntax);
+        let job = build_edit_layout("abc", &syntax, 13.0);
         let texts: Vec<&str> = job
             .sections
             .iter()
@@ -2029,6 +2094,45 @@ mod tests {
     }
 
     #[test]
+    fn handle_menu_action_increase_decrease_reset_font() {
+        let mut app = fixture("a\n", "b\n");
+        let base = app.settings.font_size;
+        app.handle_menu_action(MenuAction::IncreaseFontSize);
+        assert!(app.settings.font_size > base);
+        app.handle_menu_action(MenuAction::DecreaseFontSize);
+        assert_eq!(app.settings.font_size, base);
+        for _ in 0..3 {
+            app.handle_menu_action(MenuAction::IncreaseFontSize);
+        }
+        app.handle_menu_action(MenuAction::ResetFontSize);
+        assert_eq!(app.settings.font_size, lgtm_core::DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn font_size_clamps_at_min_and_max() {
+        let mut app = fixture("a\n", "b\n");
+        for _ in 0..50 {
+            app.handle_menu_action(MenuAction::IncreaseFontSize);
+        }
+        assert_eq!(app.settings.font_size, lgtm_core::MAX_FONT_SIZE);
+        for _ in 0..50 {
+            app.handle_menu_action(MenuAction::DecreaseFontSize);
+        }
+        assert_eq!(app.settings.font_size, lgtm_core::MIN_FONT_SIZE);
+    }
+
+    #[test]
+    fn edit_scroll_y_starts_at_zero() {
+        // The shared scroll offset for the edit-mode panes initializes
+        // to 0 so both panes line up at the top on first render. The
+        // actual cross-pane sync is driven by egui's ScrollAreaOutput
+        // offsets and is only observable in an integration test, but
+        // the field itself is unit-testable.
+        let app = fixture("a\nb\nc\n", "a\nB\nc\n");
+        assert_eq!(app.edit_scroll_y, 0.0);
+    }
+
+    #[test]
     fn handle_menu_action_hunk_nav_drives_jump_methods() {
         let mut app = fixture("a\nb\nc\nd\n", "X\nb\nY\nd\n");
         assert_eq!(app.diff.hunks.len(), 2);
@@ -2065,6 +2169,6 @@ mod tests {
             style_bits: 0,
         }]];
         // Should not panic.
-        let _ = build_edit_layout("élan\n", &syntax);
+        let _ = build_edit_layout("élan\n", &syntax, 13.0);
     }
 }

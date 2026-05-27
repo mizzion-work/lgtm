@@ -45,6 +45,12 @@ pub enum MenuAction {
     ShowShortcuts,
     /// Show the About modal.
     ShowAbout,
+    /// Bump font size by one step.
+    IncreaseFontSize,
+    /// Reduce font size by one step.
+    DecreaseFontSize,
+    /// Reset font size to the default.
+    ResetFontSize,
 }
 
 /// What state the host window can do at the moment. Drives whether items
@@ -87,6 +93,12 @@ pub const SC_OPEN_FOLDER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
 /// Keyboard shortcut: Ctrl/Cmd+Q.
 pub const SC_QUIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Q);
+/// Keyboard shortcut: Ctrl/Cmd++ (increase font).
+pub const SC_FONT_UP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals);
+/// Keyboard shortcut: Ctrl/Cmd+- (decrease font).
+pub const SC_FONT_DOWN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus);
+/// Keyboard shortcut: Ctrl/Cmd+0 (reset font).
+pub const SC_FONT_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0);
 
 /// Render the menubar. Appends emitted [`MenuAction`]s into `out`.
 pub fn render_menubar(
@@ -224,6 +236,21 @@ pub fn render_menubar(
                     out.push(MenuAction::LastHunk);
                     ui.close_menu();
                 }
+                ui.separator();
+                ui.menu_button("Font Size", |ui| {
+                    if shortcut_button(ui, "Increase", Some(&SC_FONT_UP)).clicked() {
+                        out.push(MenuAction::IncreaseFontSize);
+                        ui.close_menu();
+                    }
+                    if shortcut_button(ui, "Decrease", Some(&SC_FONT_DOWN)).clicked() {
+                        out.push(MenuAction::DecreaseFontSize);
+                        ui.close_menu();
+                    }
+                    if shortcut_button(ui, "Reset", Some(&SC_FONT_RESET)).clicked() {
+                        out.push(MenuAction::ResetFontSize);
+                        ui.close_menu();
+                    }
+                });
             });
         }
 

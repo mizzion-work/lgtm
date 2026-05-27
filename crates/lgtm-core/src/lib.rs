@@ -31,6 +31,7 @@ pub mod folder;
 pub mod highlight;
 pub mod merge;
 pub mod recent;
+pub mod settings;
 
 pub use blame::{BLAME_LINE_CAP, BlameCache, BlameInfo};
 pub use diff::{
@@ -47,3 +48,4 @@ pub use highlight::{
 };
 pub use merge::{MergeRegion, ThreeWayMerge};
 pub use recent::{MAX_RECENT, RecentEntry, RecentList, RecentMode};
+pub use settings::{DEFAULT_FONT_SIZE, FONT_SIZE_STEP, MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
