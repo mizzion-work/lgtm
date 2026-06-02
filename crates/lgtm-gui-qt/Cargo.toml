@@ -1,0 +1,25 @@
+[package]
+name = "lgtm-gui-qt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Qt-based GUI for lgtm (parallel backend to lgtm-gui)."
+
+[dependencies]
+lgtm-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# cxx-qt: KDAB's modern, actively-maintained Qt 6 binding built on cxx.
+# Generates QObjects (and the QML registrations) from Rust types,
+# letting the diff view live as a single QML window driven by Rust
+# properties. Picked over the older `qmetaobject` crate because cxx-qt
+# tracks current Qt 6.x, has a maintained crates.io release, and is
+# the binding KDAB recommends for new projects.
+cxx.workspace = true
+cxx-qt.workspace = true
+cxx-qt-lib.workspace = true
+
+[build-dependencies]
+cxx-qt-build.workspace = true

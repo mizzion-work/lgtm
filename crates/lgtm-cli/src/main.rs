@@ -79,8 +79,9 @@ struct Cli {
     follow_symlinks: bool,
 
     /// GUI backend. `eframe` (default) uses egui/eframe; `gpui` uses
-    /// Zed's gpui. Currently only the two-file diff window is wired
-    /// for the gpui backend — everything else falls through to eframe.
+    /// Zed's gpui; `qt` uses Qt 6 via cxx-qt. Currently only the
+    /// two-file diff window is wired for the alternate backends —
+    /// everything else falls through to eframe.
     #[arg(long, default_value = "eframe")]
     backend: GuiBackend,
 }
@@ -89,6 +90,7 @@ struct Cli {
 enum GuiBackend {
     Eframe,
     Gpui,
+    Qt,
 }
 
 fn main() -> ExitCode {
@@ -173,6 +175,14 @@ fn dispatch(cli: Cli) -> anyhow::Result<u8> {
              See crates/lgtm-gui-gpui/README.md for build instructions \
              (workspace.exclude on this branch keeps it from breaking the \
              default cargo build)."
+        );
+    }
+    if matches!(cli.backend, GuiBackend::Qt) {
+        anyhow::bail!(
+            "--backend qt is not buildable from the default workspace.\n\
+             See crates/lgtm-gui-qt/README.md for build instructions \
+             (workspace.exclude on this branch keeps it from breaking the \
+             default cargo build; Qt 6 must be installed on the host)."
         );
     }
     let outcome = lgtm_gui::run_diff(

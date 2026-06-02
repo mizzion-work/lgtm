@@ -10,8 +10,14 @@ members = [
     # 0.26.0's req of ^0.10 → 0.10.1 conflict). Sources are kept under
     # `crates/lgtm-gui-gpui/` as the migration scaffold; see that
     # crate's README for the path to a working build.
+    # crates/lgtm-gui-qt — excluded from the default workspace build
+    # because Qt 6 is a C++ runtime supplied by the host system, not a
+    # cargo dep. Sources are kept under `crates/lgtm-gui-qt/` as the
+    # migration scaffold; see that crate's README for prereqs
+    # (`apt install qt6-base-dev qt6-declarative-dev`, optional
+    # `QMAKE` env var) and the workspace-edit dance to re-include it.
 ]
-exclude = ["crates/lgtm-gui-gpui"]
+exclude = ["crates/lgtm-gui-gpui", "crates/lgtm-gui-qt"]
 
 [workspace.package]
 version = "0.1.0"
@@ -70,6 +76,19 @@ rfd = "0.17"
 # scaffolded crate's manifest stays valid for human readers.
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "e25458243bb5f3522fd56c12d16d145e44395053", default-features = false, features = ["x11", "wayland"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "e25458243bb5f3522fd56c12d16d145e44395053" }
+
+# cxx-qt — KDAB's Rust → Qt 6 binding. Pulled from crates.io but only
+# consumed by the excluded lgtm-gui-qt crate (see workspace.exclude
+# above): Qt itself is a system C++ runtime that has to be installed
+# separately, so this crate doesn't build end-to-end without
+# qt6-base-dev / qt6-declarative-dev (or equivalent). This entry exists
+# so the scaffolded crate's manifest stays valid for human readers and
+# resolves the moment the workspace edits in
+# `crates/lgtm-gui-qt/README.md` are applied.
+cxx           = "1"
+cxx-qt        = "0.7"
+cxx-qt-lib    = "0.7"
+cxx-qt-build  = "0.7"
 
 # Internal crates
 lgtm-core = { path = "crates/lgtm-core", version = "0.1.0" }
